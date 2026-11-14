@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Island — Your agents, one glance.</title>
+  <desc id="desc">Illustration of a native macOS task panel with Claude Code, Codex CLI and Pi sessions. Concept illustration, not an application screenshot.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101827"/><stop offset="1" stop-color="#182d36"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#57e3c0" stop-opacity=".18"/><stop offset="1" stop-color="#57e3c0" stop-opacity="0"/></radialGradient>
+    <linearGradient id="panel" x2="0" y2="1"><stop stop-color="#24323e"/><stop offset="1" stop-color="#15222e"/></linearGradient>
+  </defs>
+  <rect width="1200" height="520" rx="24" fill="url(#bg)"/>
+  <ellipse cx="930" cy="230" rx="420" ry="340" fill="url(#glow)"/>
+  <g fill="none" stroke="#85c5bd" stroke-opacity=".09">
+    <circle cx="953" cy="249" r="180"/><circle cx="953" cy="249" r="235"/><circle cx="953" cy="249" r="290"/>
+  </g>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+    <rect x="64" y="65" width="158" height="28" rx="14" fill="#24453f"/>
+    <circle cx="82" cy="79" r="4" fill="#77e8c3"/>
+    <text x="95" y="84" fill="#a3eed8" font-size="11" font-weight="600" letter-spacing="1.6">NATIVE TO macOS</text>
+    <text x="60" y="178" fill="#f4f8fa" font-size="65" font-weight="700" letter-spacing="-3">Agent Island</text>
+    <text x="64" y="225" fill="#b8ccd3" font-size="25">Your agents, one glance.</text>
+    <text x="64" y="279" fill="#859fa9" font-size="16">A quiet home for your coding sessions.</text>
+    <g font-size="13" fill="#d3e3e8" text-anchor="middle">
+      <rect x="64" y="320" width="115" height="36" rx="18" fill="#213440" stroke="#39515b"/><text x="121" y="343">Claude Code</text>
+      <rect x="189" y="320" width="107" height="36" rx="18" fill="#213440" stroke="#39515b"/><text x="242" y="343">Codex CLI</text>
+      <rect x="306" y="320" width="54" height="36" rx="18" fill="#213440" stroke="#39515b"/><text x="333" y="343">Pi</text>
+    </g>
+    <text x="64" y="452" fill="#71919b" font-size="12" letter-spacing="2">LOCAL EVENTS · NATIVE UI · HUMAN APPROVAL</text>
+    <rect x="620" y="81" width="516" height="356" rx="23" fill="#000" opacity=".18"/>
+    <rect x="610" y="69" width="516" height="356" rx="23" fill="url(#panel)" stroke="#46606a"/>
+    <path d="M781 69h174v17q0 19-19 19H800q-19 0-19-19z" fill="#0b131c"/>
+    <circle cx="929" cy="84" r="3" fill="#263d4b"/>
+    <text x="638" y="137" fill="#e8f0f4" font-size="17" font-weight="600">Your workspace</text>
+    <text x="1096" y="137" fill="#7e9ba8" font-size="12" text-anchor="end">3 sessions</text>
+    <g>
+      <rect x="632" y="158" width="472" height="69" rx="12" fill="#2c3c46"/>
+      <circle cx="656" cy="181" r="5" fill="#80dfc1"/>
+      <text x="672" y="186" fill="#e5eef1" font-size="14" font-weight="600">Claude Code</text>
+      <text x="1084" y="186" fill="#80dfc1" font-size="11" text-anchor="end">WORKING</text>
+      <text x="651" y="210" fill="#9eb4be" font-size="12">Building the next idea…</text>
+      <rect x="632" y="236" width="472" height="91" rx="12" fill="#2c3c46"/>
+      <circle cx="656" cy="260" r="5" fill="#f1cc82"/>
+      <text x="672" y="265" fill="#e5eef1" font-size="14" font-weight="600">Codex CLI</text>
+      <text x="1084" y="265" fill="#f1cc82" font-size="11" text-anchor="end">NEEDS APPROVAL</text>
+      <text x="651" y="302" fill="#9eb4be" font-size="12">Ready for your decision</text>
+      <rect x="944" y="281" width="65" height="29" rx="7" fill="#394c58"/><text x="976" y="300" text-anchor="middle" fill="#ccdce3" font-size="11">Deny</text>
+      <rect x="1018" y="281" width="67" height="29" rx="7" fill="#83dec3"/><text x="1051" y="300" text-anchor="middle" fill="#15352f" font-size="11" font-weight="600">Allow</text>
+      <rect x="632" y="336" width="472" height="66" rx="12" fill="#2c3c46"/>
+      <circle cx="656" cy="359" r="5" fill="#93b7ee"/>
+      <text x="672" y="364" fill="#e5eef1" font-size="14" font-weight="600">Pi</text>
+      <text x="1084" y="364" fill="#93b7ee" font-size="11" text-anchor="end">COMPLETED</text>
+      <text x="651" y="386" fill="#9eb4be" font-size="12">One less terminal to keep checking.</text>
+    </g>
+    <text x="1119" y="452" text-anchor="end" fill="#71919b" font-size="11">CONCEPT ILLUSTRATION</text>
+  </g>
+</svg>

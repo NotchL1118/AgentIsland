@@ -1,8 +1,43 @@
+![Agent Island：在一个原生面板中查看编程助手会话（概念示意图）](docs/assets/banner.svg)
+
+<p align="center">
+  <img alt="macOS 14+" src="https://img.shields.io/badge/macOS-14%2B-182d36?style=flat-square&amp;logo=apple&amp;logoColor=white">
+  <img alt="Swift 5.9+" src="https://img.shields.io/badge/Swift-5.9%2B-F05138?style=flat-square&amp;logo=swift&amp;logoColor=white">
+  <img alt="SwiftUI + AppKit" src="https://img.shields.io/badge/UI-SwiftUI%20%2B%20AppKit-477d95?style=flat-square">
+  <img alt="Local Unix socket" src="https://img.shields.io/badge/IPC-Local%20Unix%20socket-397964?style=flat-square">
+</p>
+
 # AgentIsland
 
 macOS 原生 AI 编程助手任务面板。支持 Claude Code、Codex CLI 和 Pi，使用 SwiftUI + AppKit；运行状态与审批通过本机 Unix socket 传递。
 
 在菜单栏、屏幕顶部刘海或自由浮条中集中查看多个编程会话，处理支持的审批请求，并跳转回对应终端。应用显示名称为 **Agent Island**。
+
+> 顶部横幅为概念示意图；实际界面可通过下方的 `--demo` 模式体验。
+
+| ◒ 一眼掌握进度 | ◇ 在面板中审批 | ↗ 回到工作现场 |
+| :--- | :--- | :--- |
+| 集中查看多个会话的运行、等待与完成状态 | 支持的请求可直接允许或拒绝，明确操作后才回传 | 跳转到对应终端，继续处理会话 |
+
+[开始使用](#获取源码) · [连接 Agent](#连接-agent) · [工作原理](#工作原理) · [当前边界](#当前边界)
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    C[Claude Code] --> H[Hooks / 扩展]
+    X[Codex CLI] --> H
+    P[Pi] --> H
+    H -->|本机 Unix socket| A[Agent Island]
+    A --> S[会话状态与完成提醒]
+    A --> U[用户处理审批]
+    U -->|支持回传的请求，沿原连接返回| H
+    A --> T[跳转对应终端]
+    style A fill:#203c39,stroke:#80dfc1,color:#effff9
+    style U fill:#413b2c,stroke:#f1cc82,color:#fff4dc
+```
+
+事件在本机传递；不同 Agent 的审批和问答支持范围见下方接入表。
 
 ## 获取源码
 
