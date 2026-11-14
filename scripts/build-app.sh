@@ -7,15 +7,17 @@ if [[ "$CONFIGURATION" != release && "$CONFIGURATION" != debug ]]; then
   print -u2 'Usage: scripts/build-app.sh [release|debug]'
   exit 2
 fi
-swift build --configuration "$CONFIGURATION"
+swift build --configuration "$CONFIGURATION" --product AgentIsland
+swift build --configuration "$CONFIGURATION" --product agent-island-hook
 BIN_DIR="$(swift build --configuration "$CONFIGURATION" --show-bin-path)"
 APP_DIR="$PROJECT_DIR/dist/Agent Island.app"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+rm -rf "$APP_DIR/Contents/Resources/Integrations"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Helpers" "$APP_DIR/Contents/Resources/Integrations"
 cp "$BIN_DIR/AgentIsland" "$APP_DIR/Contents/MacOS/AgentIsland"
+# Compiled hook runtime used by Claude Code / Codex hooks (via the stable shim).
+cp "$BIN_DIR/agent-island-hook" "$APP_DIR/Contents/Helpers/agent-island-hook"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
-if [[ -d "$APP_DIR/Contents/Resources/Integrations" ]]; then
-  rm -rf "$APP_DIR/Contents/Resources/Integrations"
-fi
-COPYFILE_DISABLE=1 /usr/bin/tar -C "$PROJECT_DIR" --exclude='__pycache__' --exclude='*.pyc' -cf - Integrations | /usr/bin/tar -C "$APP_DIR/Contents/Resources" -xf -
+# Session-scoped extensions only; persistent hooks no longer ship as scripts.
+cp "$PROJECT_DIR/Integrations/pi-extension.ts" "$APP_DIR/Contents/Resources/Integrations/"
 /usr/bin/codesign --force --deep --sign - "$APP_DIR"
 print "Built: $APP_DIR"

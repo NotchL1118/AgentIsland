@@ -37,7 +37,12 @@ const ctx = {
   ui: { confirm: async () => { fallbackCalls++; return false; } },
 };
 const pi = { on: (name, handler) => handlers.set(name, handler), registerFlag: (name, options) => flags.set(name, options.default), getFlag: name => flags.get(name) };
-const emit = (name, event = {}) => handlers.get(name)(event, ctx);
+// Status events are fire-and-forget; give the socket a moment to deliver them.
+const emit = async (name, event = {}) => {
+  const result = await handlers.get(name)(event, ctx);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  return result;
+};
 try {
   agentIsland(pi);
   assert.equal(flags.get('island-approve-tools'), false);
@@ -92,6 +97,15 @@ try {
   ctx.hasUI = false;
   const blocked = await emit('tool_call', { toolName: 'bash', toolCallId: 'offline', input: { command: 'npm test' } });
   assert.equal(blocked.block, true, 'offline non-interactive mode never auto-approves');
+
+  // A panel that accepts connections but never replies must not slow the agent loop.
+  const hung = createServer(() => {});
+  await new Promise(resolve => hung.listen(socketPath, resolve));
+  const started = performance.now();
+  await handlers.get('tool_execution_start')({ toolName: 'bash', toolCallId: 'slow' }, ctx);
+  await handlers.get('tool_execution_end')({ toolName: 'bash', toolCallId: 'slow', isError: false }, ctx);
+  assert.ok(performance.now() - started < 50, 'status handlers return without waiting for the panel');
+  hung.close();
   console.log('Pi extension: lifecycle, passive mode, approval identity, rejection, UI fallback, cancellation, and completion checks passed.');
 } finally {
   if (server.listening) await new Promise(resolve => server.close(resolve));

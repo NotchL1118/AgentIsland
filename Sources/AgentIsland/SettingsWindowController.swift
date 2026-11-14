@@ -35,6 +35,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         model.showingSettings = false
         model.expanded = false
         model.isSettingsWindowVisible = true
+        model.refreshIntegrations()
         if window?.isMiniaturized == true { window?.deminiaturize(nil) }
         showWindow(nil)
         if activate { NSApp.activate() }

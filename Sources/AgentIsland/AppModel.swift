@@ -3,6 +3,7 @@ import SwiftUI
 import UserNotifications
 import ServiceManagement
 import IslandCore
+import IslandIntegrations
 
 enum SettingsSection: String, CaseIterable {
     case general
@@ -31,6 +32,7 @@ final class AppModel: ObservableObject {
     @Published var launchAtLogin = false
     @Published var integrationBusy = false
     @Published var integrationOutput = ""
+    @Published private(set) var integrationStatuses: [AgentProvider: IntegrationStatus] = [:]
     let demo: Bool
     private let defaults: UserDefaults
     private let socketPath: String
@@ -68,7 +70,17 @@ final class AppModel: ObservableObject {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
         if demo { loadDemo() }
-        else { startServer() }
+        else {
+            startServer()
+            // Keep the stable hook forwarder pointing at this copy of the app (only if something is installed).
+            // Only a real app bundle may re-point it; dev builds and test runners never touch it.
+            let bundledHelper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/agent-island-hook").path
+            if Bundle.main.bundleURL.pathExtension == "app", FileManager.default.isExecutableFile(atPath: bundledHelper) {
+                let manager = IntegrationManager(IntegrationEnvironment(helperPath: bundledHelper))
+                Task.detached(priority: .utility) { manager.refreshShimIfInstalled() }
+            }
+            refreshIntegrations()
+        }
         cleanup = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.expirePending() }
         }
@@ -248,45 +260,54 @@ final class AppModel: ObservableObject {
         if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Integrations")
     }
-    func install(_ provider: AgentProvider, remove: Bool = false) {
-        guard !integrationBusy else { return }
-        if provider == .pi {
-            let command = "pi -e " + shellQuote(integrationsDirectory.appendingPathComponent("pi-extension.ts").path)
-            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(command, forType: .string)
-            integrationOutput = "已复制 Pi 启动命令。可在终端粘贴执行。\n工具审批为可选参数 --island-approve-tools。"
-            return
+    /// The compiled hook runtime: bundled in Contents/Helpers, or next to the binary during `swift run`.
+    var hookHelperPath: String? {
+        let candidates = [Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/agent-island-hook"),
+                          Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("agent-island-hook")]
+        return candidates.compactMap { $0?.path }.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+    var integrationManager: IntegrationManager { IntegrationManager(IntegrationEnvironment(helperPath: hookHelperPath)) }
+
+    func refreshIntegrations() {
+        let manager = integrationManager
+        Task {
+            let statuses = await Task.detached(priority: .utility) {
+                Dictionary(uniqueKeysWithValues: AdapterRegistry.all.map { ($0.descriptor.provider, manager.status($0.descriptor.provider)) })
+            }.value
+            integrationStatuses = statuses
         }
-        let script = integrationsDirectory.appendingPathComponent(provider == .claude ? "bridge.py" : "codex/codex_bridge.py")
-        guard FileManager.default.fileExists(atPath: script.path) else { integrationOutput = "找不到接入脚本，请运行打包后的应用。"; return }
-        let command = provider == .claude ? (remove ? "uninstall-claude" : "install-claude") : (remove ? "uninstall" : "install")
+    }
+    func install(_ provider: AgentProvider, remove: Bool = false) {
+        runIntegration { manager in
+            let report = remove ? try manager.uninstall(provider) : try manager.install(provider)
+            return [report]
+        }
+    }
+    /// Remove every integration Agent Island ever wrote, then its own support files.
+    func uninstallEverything() {
+        runIntegration { manager in manager.uninstallEverything() }
+    }
+    private func runIntegration(_ work: @escaping @Sendable (IntegrationManager) throws -> [IntegrationReport]) {
+        guard !integrationBusy, !demo else { return }
         integrationBusy = true; integrationOutput = "正在更新接入配置…"
+        let manager = integrationManager
         Task {
             let result = await Task.detached(priority: .utility) { () -> String in
-                let process = Process(); let output = Pipe()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                process.arguments = ["python3", script.path, command]
-                process.standardOutput = output; process.standardError = output
                 do {
-                    try process.run()
-                    let data = output.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    let text = String(data: data, encoding: .utf8) ?? ""
-                    return (process.terminationStatus == 0 ? "" : "接入失败：\n") + text
+                    let reports = try work(manager)
+                    if reports.isEmpty { return "没有发现需要处理的接入。" }
+                    return reports.map { ([$0.path] + $0.lines.map { "  " + $0 }).joined(separator: "\n") }.joined(separator: "\n")
                 } catch { return "接入失败：\(error.localizedDescription)" }
             }.value
             integrationOutput = result; integrationBusy = false
+            refreshIntegrations()
         }
     }
     func copyLaunchCommand(_ provider: AgentProvider) {
-        let base = integrationsDirectory
-        let command: String
-        switch provider {
-        case .pi: command = "pi -e " + shellQuote(base.appendingPathComponent("pi-extension.ts").path)
-        case .codex: command = "python3 " + shellQuote(base.appendingPathComponent("codex/codex_bridge.py").path) + " launch"
-        case .claude: command = "claude"
-        }
+        guard case .sessionExtension(let resource)? = AdapterRegistry.adapter(for: provider)?.descriptor.injection else { return }
+        let command = "\(provider.rawValue) -e " + shellQuote(integrationsDirectory.appendingPathComponent(resource).path)
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(command, forType: .string)
-        integrationOutput = "已复制：\(command)"
+        integrationOutput = "已复制：\(command)\n工具审批为可选参数 --island-approve-tools。"
     }
     private func shellQuote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     func loadDemo() {

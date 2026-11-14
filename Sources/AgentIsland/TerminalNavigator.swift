@@ -55,9 +55,10 @@ enum TerminalNavigator {
         }
         return await MainActor.run {
             guard let running = NSRunningApplication.runningApplications(withBundleIdentifier: app).first else {
-                return NavigationOutcome(message: "原终端未运行，请手动打开对应会话。", precise: false)
+                return NavigationOutcome(message: "原应用未运行，请手动打开对应会话。", precise: false)
             }
             running.activate()
+            if app == "com.openai.codex" { return NavigationOutcome(message: "已打开 Codex，请在侧栏选择对应对话。", precise: false) }
             return NavigationOutcome(message: "已激活终端应用；当前接入无法精确定位此标签。", precise: false)
         }
     }

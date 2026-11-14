@@ -91,7 +91,9 @@ export default function agentIsland(pi: ExtensionAPI) {
     return { version: 1, id: randomUUID(), provider: "pi", sessionID: ctx.sessionManager.getSessionId(), turnID,
       timestamp: Date.now() / 1000, kind, title, cwd: ctx.cwd, terminal, ...fields };
   }
-  const notify = async (ctx: ExtensionContext, kind: string, fields: Event = {}) => { await sendEvent(event(ctx, kind, fields)); };
+  // Status events are fire-and-forget so a slow or absent panel never delays the agent loop.
+  // Only approvals (and the final shutdown, before the process exits) wait for the socket.
+  const notify = (ctx: ExtensionContext, kind: string, fields: Event = {}): void => { void sendEvent(event(ctx, kind, fields)); };
 
   pi.on("session_start", async (_event, ctx) => {
     active = false; turnID = undefined; finalText = ""; failed = false;
@@ -154,7 +156,7 @@ export default function agentIsland(pi: ExtensionAPI) {
     active = false;
   });
   pi.on("session_shutdown", async (_event, ctx) => {
-    await notify(ctx, "sessionEnded", { message: "Pi 会话已结束" });
+    await sendEvent(event(ctx, "sessionEnded", { message: "Pi 会话已结束" }), 300);
     active = false;
   });
 }
