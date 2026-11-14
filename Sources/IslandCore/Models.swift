@@ -1,13 +1,42 @@
 import Foundation
 
-public enum AgentProvider: String, Codable, CaseIterable, Sendable {
-    case claude, codex, pi
+/// Open set of agent identities. Unknown providers decode instead of failing,
+/// so a new adapter never requires the app to learn a new enum case first.
+public struct AgentProvider: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        guard !value.isEmpty, value.count <= 64 else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Invalid provider"))
+        }
+        rawValue = value
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 
+    public static let claude: AgentProvider = "claude"
+    public static let codex: AgentProvider = "codex"
+    public static let pi: AgentProvider = "pi"
+
+    /// Display metadata lives with the identity; unknown agents still render.
     public var displayName: String {
         switch self {
         case .claude: return "Claude Code"
         case .codex: return "Codex"
         case .pi: return "Pi"
+        default: return rawValue.prefix(1).uppercased() + rawValue.dropFirst()
+        }
+    }
+    public var glyph: String {
+        switch self {
+        case .claude: return "✳"
+        case .codex: return ">_"
+        case .pi: return "π"
+        default: return String(displayName.prefix(1))
         }
     }
 }

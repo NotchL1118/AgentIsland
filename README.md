@@ -48,14 +48,14 @@ cd AgentIsland
 
 ## 构建与运行
 
-要求 macOS 14+、Xcode/Command Line Tools（Swift 5.9+）；Claude/Codex hooks 需要 Python 3。无需安装 Swift 第三方依赖。
+要求 macOS 14+、Xcode/Command Line Tools（Swift 5.9+）。无需 Python，也无需安装 Swift 第三方依赖。
 
 ```sh
 zsh scripts/build-app.sh
 open 'dist/Agent Island.app'
 ```
 
-先把应用放到打算长期保留的位置，再安装 Agent 接入。接入脚本记录绝对路径，移动应用后需重新安装接入。
+应用可以随意移动或更新：Agent 配置里只写一个固定的转发入口，应用每次启动时会把它指向自己的新位置，无需重新安装接入。
 
 点击菜单栏图标展开/收起，右键打开设置或切换显示方式。默认不会申请通知权限，设置中可按需启用。
 
@@ -75,19 +75,36 @@ open -n 'dist/Agent Island.app' --args --demo
 
 ## 连接 Agent
 
-在设置中点击“安装接入”才会改动对应配置。安装前备份，卸载只移除本工具负责的条目。构建和测试不会修改你的 Agent 配置。
+在设置的“Agent 接入”中点击“安装接入”才会改动对应配置；之后照常直接使用 `claude` 或打开 Codex Desktop，不需要任何启动前缀。
 
 | Agent | 监控与完成 | 面板审批 | 面板问答 |
 | --- | --- | --- | --- |
 | Claude Code | 支持 | 支持单次允许/拒绝 | AskUserQuestion 单选、自定义文本；多选和计划模式回终端 |
-| Codex CLI | 支持官方 hooks | 支持 PermissionRequest | 回终端处理 |
-| Pi 1.3+ | 扩展接入 | 可选，需 `--island-approve-tools` | 显示待回答，回 Pi 处理 |
+| Codex Desktop / CLI | 支持官方 hooks | 支持 PermissionRequest | 回 Codex 处理 |
+| Pi 1.3+ | 扩展接入（按会话加载） | 可选，需 `--island-approve-tools` | 显示待回答，回 Pi 处理 |
 
-- **Claude Code**：设置中安装后重新启动 CLI。也可执行 `python3 Integrations/bridge.py install-claude`。
-- **Codex**：设置中安装后，在 Codex `/hooks` 中检查并信任新定义。使用“启动命令”复制包装命令，可更可靠地保留终端身份。不会绕过 Codex 的信任设置。
-- **Pi**：设置中复制启动命令，使用 `pi -e /绝对路径/pi-extension.ts` 加载扩展，不需要改全局配置。
+- **Claude Code**：安装后重启 Claude Code。
+- **Codex**：Desktop 与 CLI 共用 `~/.codex/hooks.json`。安装后在 Codex 的 hooks 设置（CLI 为 `/hooks`）中检查并信任新定义，设置页会显示已信任的数量。不会绕过 Codex 的信任设置。
+- **Pi**：设置中复制启动命令，使用 `pi -e /绝对路径/pi-extension.ts` 加载扩展，不改任何配置。
 
-详细说明：[Claude/Pi 接入](Integrations/README.md)、[Codex 接入](Integrations/codex/README.md)。
+### 对 Agent 零侵入、卸载干净
+
+- **不拖慢 Agent**：状态类 hook 以异步方式注册，不在 Agent 主循环里等待；只有审批与问答这类必须等结果的 hook 才同步。面板未运行时 hook 在几毫秒内退出。
+- **删掉应用也安全**：配置里的命令只调用一个固定转发入口，并先检查它是否存在；应用被移动、删除，或转发入口被清理时，hook 一律静默以 0 退出，不会阻断 Agent。
+- **卸载即还原**：每次写入都记账。移除时只删带 Agent Island 标记的条目；若配置自安装后未被改动，按字节还原原文件；原本不存在的文件会被删除；Codex 会同步删掉对应的信任记录，并重排之后用户 hook 的信任序号。卸载后会复查，确认没有残留。
+- **完全卸载**：设置页“完全卸载…”会清理所有记录过的位置、扫描到的残留（包括自定义的 `~/.claude-*` 配置目录），并删除 `~/Library/Application Support/AgentIsland`。之后直接删除应用即可。
+
+也可在终端使用应用内置的同一套工具：
+
+```sh
+H='/Applications/Agent Island.app/Contents/Helpers/agent-island-hook'
+"$H" status                         # 查看接入、信任与残留
+"$H" install claude                 # 或 codex；--config <path> 指定其他配置文件
+"$H" uninstall codex
+"$H" uninstall-all                  # 完全卸载
+```
+
+详细说明：[接入说明](Integrations/README.md)。
 
 ## 已实现
 
@@ -102,7 +119,7 @@ open -n 'dist/Agent Island.app' --args --demo
 
 ## 当前边界
 
-- 本版对接 CLI；不接管 Codex Desktop 的现有聊天。没有远程 SSH、额度统计、手机推送、子 Agent 分组或 tmux 精确分屏。
+- Codex Desktop 通过官方 hooks 接入，点击会话会打开 Codex，但不能直接定位到具体对话；Desktop 下各类 hook 的覆盖范围仍需实际使用验证。没有远程 SSH、额度统计、手机推送、子 Agent 分组或 tmux 精确分屏。
 - 会话状态保存在内存中，重启后由新的 Agent 事件重新发现；不会扫描你的历史聊天。正在等待的审批回到原 Agent，不伪装恢复失效的回传连接。
 - 跨轮次隔离依赖上游提供可靠轮次 ID。旧版 Claude 未提供 `prompt_id` 时按事件时序降级，不伪造轮次身份。
 - Terminal/iTerm2 精确跳转可能触发 macOS“自动化”授权；拒绝后降级到激活应用。未提供应用身份时明确提示手动返回。
@@ -113,8 +130,6 @@ open -n 'dist/Agent Island.app' --args --demo
 
 ```sh
 swift test
-python3 -m unittest discover -s Tests/BridgeTests -p 'test_bridge.py' -v
-python3 -m unittest discover -s Tests/CodexTests -v
 node --experimental-strip-types Tests/BridgeTests/pi-extension.test.mjs
 ```
 
@@ -125,10 +140,12 @@ node --experimental-strip-types Tests/BridgeTests/pi-extension.test.mjs
 ```text
 Sources/IslandCore/       事件协议、会话模型、状态引擎
 Sources/AgentIsland/      原生界面、窗口、Socket、导航与接入设置
-Integrations/             Claude/Codex hooks 与 Pi 扩展
-Tests/                    状态、接入脚本、应用通信验证
+Sources/IslandIntegrations/ Agent 适配器、hook 运行时、安装与卸载引擎
+Sources/AgentIslandHook/  agent-island-hook（打包在 Contents/Helpers）
+Integrations/             Pi 扩展（按会话加载）
+Tests/                    状态、适配器、安装卸载、应用通信验证
 Resources/Info.plist       macOS 应用信息
 scripts/build-app.sh       构建与本机打包
 ```
 
-新增 Agent 时实现事件映射和回传逻辑，主界面不需要复制一套。协议见 [PROTOCOL.md](PROTOCOL.md)。
+新增 Agent 时，在 `Sources/IslandIntegrations` 中实现一个 `AgentAdapter`（声明能力、要注册的 hook 和配置位置，实现事件映射与回写），再加入 `AdapterRegistry`。界面、安装、记账、卸载与残留扫描都由它的描述自动生成，`provider` 也是开放字符串，主界面无需改动。协议见 [PROTOCOL.md](PROTOCOL.md)。

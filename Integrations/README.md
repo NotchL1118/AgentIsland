@@ -1,92 +1,79 @@
 # Agent Island 接入
 
-本目录实现本地 CLI 事件接入，不读取历史对话、登录凭据或模型 API Key。正常运行不需要第三方 Python/Node 依赖。
+接入层只读取 Agent 通过官方 hook/扩展主动交给它的事件，不读取历史对话、登录凭据或模型 API Key，也不依赖 Python 或第三方 Node 包。
 
-## 当前能力
+## 结构
+
+```text
+Agent 配置（settings.json / hooks.json）
+   └─ /bin/sh -c '<存在性检查>' … hook <agent> [--wait] --agent-island-owned
+        └─ ~/Library/Application Support/AgentIsland/bin/agent-island-hook   固定转发入口（shim）
+             └─ Agent Island.app/Contents/Helpers/agent-island-hook          编译好的 hook 运行时
+                  └─ 本机 Unix socket → Agent Island
+```
+
+- **配置里的命令永远不变。** 它不指向应用包，而是调用固定位置的转发入口，并先检查入口是否可执行。应用移动或更新时，只需更新转发入口（应用启动时自动完成），Codex 基于内容哈希的信任也不会失效。
+- **删除应用后无害。** 转发入口找不到应用、或转发入口本身不存在时，hook 读完 stdin 后以 0 退出（Codex 输出 `{}`）。Claude Code 把 exit 2 视为阻断（会拦下工具调用、提示和 Stop），这条路径永远不会产生 2。
+- **只有需要结果的 hook 才同步。** Claude 的 `PermissionRequest` 与 `PreToolUse[AskUserQuestion]`、Codex 的 `PermissionRequest` 带 `--wait` 同步执行；其他 hook 均注册为 `async: true`。面板未运行时，hook 不探测终端，直接退出。
+- **归属只认自己写下的完整命令形态**（转发入口路径 + 结尾标记 `--agent-island-owned`）。仅在文字里提到标记的用户 hook 不会被当成我们的。
+
+## 能力
 
 | Agent | 状态 / 完成 | 面板审批 | 面板回答 |
 | --- | --- | --- | --- |
-| Claude Code | SessionStart、UserPromptSubmit、工具事件、Stop、StopFailure、SessionEnd | PermissionRequest 单次允许/拒绝 | AskUserQuestion 单选与自定义文本，多题逐题回答 |
-| Pi 1.3+ | 生命周期、工具活动、最终 agent_settled、异常/中断 | 显式开启 `--island-approve-tools` 后，审批 bash/write/edit | 原生扩展问题可显示“等待回答”，需回 Pi 处理 |
+| Claude Code | SessionStart、UserPromptSubmit、工具事件、Notification、Stop、StopFailure、SessionEnd | PermissionRequest 单次允许/拒绝 | AskUserQuestion 单选与自定义文本，多题逐题回答 |
+| Codex Desktop / CLI | SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、Stop、Interrupt、SessionEnd | PermissionRequest 允许/拒绝 | 回 Codex 处理 |
+| Pi 1.3+ | 生命周期、工具活动、最终 agent_settled、异常/中断 | 显式开启 `--island-approve-tools` 后，审批 bash/write/edit | 原生扩展问题显示“等待回答”，需回 Pi 处理 |
 
-Claude 包含多选题的 AskUserQuestion，以及 ExitPlanMode，保留原生界面处理；不把单选按钮伪装成多选支持。这里只管理本轮任务状态，不把一次工具失败误判为整轮任务失败。
+所有审批只在收到 `requestID` 匹配、`status: "resolved"` 的明确决定后才写出结果；面板不存在、断连、超时或回复不匹配时，交回 Agent 自己的审批流程，绝不默认放行。拒绝只作用于当前请求，不写入持久授权。
 
-Claude 的共同 hook 字段 `prompt_id` 是可选的：有该字段时按真实轮次识别事件；没有该字段的版本只能按事件时序降级，无法保证识别跨轮次迟到的完成事件。不会用当前轮次 ID 猜测补齐旧事件。
+Claude 含多选题的 AskUserQuestion 与 ExitPlanMode 保留原生界面处理；任何一题无法回答时，整个工具调用原样交回 Claude，不做部分改写。Codex 的子 Agent 生命周期 hook 不注册：它们携带父会话 ID，会把子任务完成误报为主任务完成。
 
-## Claude Code
+## 安装、卸载与记账
 
-在仓库根目录执行以下命令，或使用应用内的接入按钮：
-
-```sh
-python3 Integrations/bridge.py install-claude
-```
-
-只有显式调用安装命令才会编辑 `~/.claude/settings.json`（设置了 `CLAUDE_CONFIG_DIR` 时使用对应目录）。现有配置会备份到同目录 `settings.json.agent-island-backup-*`，安装幂等，只管理带有专属标记的 hook。原文件是符号链接时，保留链接并更新其目标文件。重新启动 Claude Code 后生效。
-
-可以指定项目级配置：
+设置页的“安装接入 / 移除 / 完全卸载…”与命令行等价：
 
 ```sh
-python3 Integrations/bridge.py install-claude --settings /path/to/project/.claude/settings.local.json
-python3 Integrations/bridge.py uninstall-claude --settings /path/to/project/.claude/settings.local.json
+H='/Applications/Agent Island.app/Contents/Helpers/agent-island-hook'
+"$H" install claude                       # 写入 ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json
+"$H" install codex                        # 写入 ${CODEX_HOME:-~/.codex}/hooks.json（Desktop 与 CLI 共用）
+"$H" install claude --config ~/.claude-work/settings.json
+"$H" status
+"$H" uninstall claude
+"$H" uninstall-all
 ```
 
-卸载默认接入：
-
-```sh
-python3 Integrations/bridge.py uninstall-claude
-```
-
-安装命令记录 bridge 脚本的绝对路径；移动应用或仓库后应重新安装接入。卸载不会覆盖其他 hook、权限、模型或状态栏设置。
-
-普通事件最多等待应用 0.8 秒，审批/问答总共最多等待 120 秒。面板不存在、断连、超时或返回错误请求 ID 时，hook 不输出任何允许结果，交回 Claude Code 的原生权限/问题流程；没有原生交互能力的运行模式按 Claude 自身规则处理。拒绝仅作用于当前请求，不写入持久授权规则。
+- **记账**：每个写过的文件都登记在 `~/Library/Application Support/AgentIsland/ledger.json`，包括原文件是否存在。首次安装时把原文件备份到同目录的 `backups/`，不再在 Agent 的配置目录里留下备份文件。
+- **安装**：只追加在已有分组之后，用户 hook 的位置不变；重复安装不会改动文件。写入前后会比对文件内容，期间若被 Agent 或用户修改则放弃写入。符号链接会保留，修改其目标文件。
+- **卸载**：删除带标记的条目（与用户 hook 共用的分组只删掉我们那一项）。若删除后与原文件结构一致，就按字节写回原文件；原本不存在的文件会被删除；安装后用户又做了修改，则保留这些修改。最后复查确认没有残留，并删除对应备份。最后一个接入移除后，`AgentIsland` 支持目录也一并删除。
+- **Codex 信任**：Codex 把信任记录在 `config.toml` 的 `[hooks.state."<hooks.json>:<事件>:<分组>:<hook>"]` 中，键是按位置编的。卸载时删除我们那几条，并把之后被前移的用户 hook 的键改到新位置；`config.toml` 的其他行一字不改。
+- **完全卸载**：处理账本里的所有位置、默认位置，以及在 `~/.claude*/settings*.json` 中扫描到的带标记条目，最后删除 `AgentIsland` 支持目录。
 
 ## Pi
 
 将扩展路径传给 Pi 即可，不改全局配置：
 
 ```sh
-pi -e /absolute/path/to/CodeLand/Integrations/pi-extension.ts
+pi -e '/Applications/Agent Island.app/Contents/Resources/Integrations/pi-extension.ts'
+pi -e '…/pi-extension.ts' --island-approve-tools     # 执行 bash/write/edit 前先在面板审批
 ```
 
-默认是被动监控。要在执行 bash/write/edit 前增加审批：
+状态事件发送后不等待回复，面板卡住也不会拖慢 Pi。扩展只在收到匹配的显式允许后放行；面板不可用时，支持交互的 Pi 会显示自己的确认框，没有交互 UI 或用户拒绝/超时则阻止该操作。
 
-```sh
-pi -e /absolute/path/to/CodeLand/Integrations/pi-extension.ts --island-approve-tools
-```
+## 新增 Agent
 
-扩展只在收到匹配的显式允许后放行。面板不可用时，支持交互的 Pi 会显示自己的确认框；没有交互 UI 或用户拒绝/超时则阻止该操作。用户中断时取消等待。
+在 `Sources/IslandIntegrations` 中实现 `AgentAdapter` 并加入 `AdapterRegistry.all`：
 
-Pi 的 `agent_end` 可能随后重试或继续，因此完成提醒由 `agent_settled` 触发。其他扩展的阻塞问题通过 `ui_prompt_start/end` 反映等待状态，但不尝试伪造答案或接管未公开的回传接口。
+- `descriptor`：显示说明、能力（status / approval / question）、注入方式（`hookConfig` 指定配置文件位置与信任存储，或 `sessionExtension`），以及要注册的 hook（是否同步、超时）。
+- `handle(_:waiting:context:)`：把 Agent 的 hook 载荷映射为协议事件；需要回写时，只在收到匹配的明确决定后输出 Agent 要求的格式。
 
-## 本地协议
-
-- 默认 Socket：`$TMPDIR/agent-island-<uid>.sock`；可用 `AGENT_ISLAND_SOCKET` 指定。
-- 每次连接发一个 UTF-8 JSON 行，接收一个 JSON 行。
-- 版本为 `1`；时间为 Unix epoch 秒；会话 ID 在同一 Agent 内保持稳定。
-- 审批/回答只接受 `status: "resolved"`，且 `requestID` 必须与发出的请求一致。
-- 超时/取消可发送 `requestCancelled` 清除待处理卡片。
-- 终端定位使用已有环境变量及当前进程控制 TTY，不模拟键盘输入。
-- 如果终端未提供足够定位信息，应用应退回激活宿主应用。
-
-发测试事件：
-
-```sh
-printf '%s\n' '{"version":1,"id":"example-1","provider":"claude","sessionID":"example","timestamp":1,"kind":"sessionStarted","title":"Example"}' | python3 Integrations/bridge.py emit
-```
+界面、安装、记账、卸载、残留扫描与 `status` 都从描述生成。协议见 [PROTOCOL.md](../PROTOCOL.md)。
 
 ## 验证
 
 ```sh
-python3 -m unittest discover -s Tests/BridgeTests -p 'test_bridge.py' -v
+swift test
 node --experimental-strip-types Tests/BridgeTests/pi-extension.test.mjs
 ```
 
-测试使用临时目录中的配置和 Unix socket，不连接模型或修改真实用户配置。Pi 扩展还通过了本机安装的 Pi 1.3.0 扩展加载器验证。Claude Code 的实际模型回合尚需在用户启用接入后验证。
-
-## 文档依据
-
-- [Claude Code hooks reference](https://code.claude.com/docs/en/hooks)：PermissionRequest、AskUserQuestion、JSON 决策及配置合并。
-- [Pi extension documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)：生命周期、工具拦截、CLI flags 与 UI 上下文。
-- 本机 Pi 1.3.0 的 `dist/core/extensions/types.d.ts` 用于核实具体事件字段。
-
-文档查询日期：2026-11-14。
+测试只使用临时 HOME、临时配置与隔离 socket，不连接模型，也不读写你的真实 Agent 配置。安装测试会通过 `/bin/sh` 实际执行写入的 hook 命令，验证应用和转发入口被删除后仍以 0 退出。

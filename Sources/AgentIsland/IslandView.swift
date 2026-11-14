@@ -219,7 +219,7 @@ struct SessionCard: View {
         switch session.provider {
         case .claude: return Color(red: 0.93, green: 0.75, blue: 0.66)
         case .codex: return Color(red: 0.69, green: 0.78, blue: 0.96)
-        case .pi: return accent
+        default: return accent
         }
     }
     private var statusColor: Color {
@@ -298,8 +298,8 @@ struct SessionCard: View {
     }
 
     private var avatar: some View {
-        Text(session.provider == .claude ? "✳" : session.provider == .codex ? ">_" : "π")
-            .font(.system(size: session.provider == .codex ? 11 : 20, weight: .medium, design: .monospaced))
+        Text(session.provider.glyph)
+            .font(.system(size: session.provider.glyph.count > 1 ? 11 : 20, weight: .medium, design: .monospaced))
             .foregroundStyle(color)
             .frame(width: 28, height: 28)
             .background(color.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))

@@ -26,7 +26,7 @@
 }
 ```
 
-`provider`：`claude`、`codex`、`pi`。会话以 `provider:sessionID` 命名，不能仅按工作目录区分。
+`provider`：开放字符串（1–64 字符），内置 `claude`、`codex`、`pi`；未知值也会被接受并显示，便于新增 Agent 时不必先升级应用。会话以 `provider:sessionID` 命名，不能仅按工作目录区分。
 
 `kind`：`sessionStarted`、`turnStarted`、`toolStarted`、`toolFinished`、`approvalRequested`、`questionRequested`、`requestCancelled`、`turnCompleted`、`turnFailed`、`sessionEnded`、`heartbeat`。
 
