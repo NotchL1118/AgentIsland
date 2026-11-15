@@ -38,11 +38,7 @@ final class AppModel: ObservableObject {
     private let defaults: UserDefaults
     private let socketPath: String
     private var server: SocketServer?
-    private var pending: [String: Pending] = [:]
-    private var cleanup: Timer?
-    private var demoTasks: [Task<Void, Never>] = []
     private var feedbackTask: Task<Void, Never>?
-    private struct Pending { let sessionID: String; let requestID: String; let connection: EventConnection }
     var sessions: [SessionState] {
         store.sessions.values.sorted {
             if $0.status.needsAttention != $1.status.needsAttention { return $0.status.needsAttention }
@@ -51,6 +47,7 @@ final class AppModel: ObservableObject {
     }
     var pendingCount: Int { sessions.reduce(0) { $0 + max($1.pendingRequests.count, $1.status.needsAttention ? 1 : 0) } }
     var runningCount: Int { sessions.filter { $0.status == .working }.count }
+    var completedCount: Int { sessions.filter { $0.status == .completed }.count }
     var summary: String {
         if pendingCount > 0 { return "\(pendingCount) 待处理 · \(runningCount) 运行" }
         if runningCount > 0 { return "\(runningCount) 个任务运行中" }
@@ -82,96 +79,43 @@ final class AppModel: ObservableObject {
             }
             refreshIntegrations()
         }
-        cleanup = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.expirePending() }
-        }
     }
     func startServer() {
         let server = SocketServer(path: socketPath) { [weak self] event, connection in
-            Task { @MainActor in self?.receive(event, connection: connection) }
+            // Acknowledge receipt before scheduling UI work. Legacy bridges also
+            // receive no decision and can immediately continue in their host.
+            connection.reply(BridgeReply(status: "accepted"))
+            Task { @MainActor in self?.receive(event) }
         }
         do { try server.start(); self.server = server; serverReady = true; statusMessage = "" }
         catch { statusMessage = error.localizedDescription; serverReady = false }
     }
-    private func requestKey(_ session: String, _ request: String) -> String { session + "\u{0}" + request }
-    private func receive(_ event: AgentEvent, connection: EventConnection) {
-        let sessionID = event.provider.rawValue + ":" + event.sessionID
-        let needsReply = (event.kind == .approvalRequested || event.kind == .questionRequested) && event.request != nil
-        if needsReply {
-            guard let request = event.request, !request.id.isEmpty,
-                  (event.kind == .approvalRequested && request.kind == .approval) || (event.kind == .questionRequested && request.kind == .question) else {
-                connection.reply(BridgeReply(status: "error", message: "Missing or inconsistent request")); return
-            }
-            if pending[requestKey(sessionID, request.id)] != nil {
-                connection.reply(BridgeReply(status: "duplicate", requestID: request.id, message: "Request already pending; do not cancel the original")); return
-            }
-        }
+    private func receive(_ event: AgentEvent) {
+        let sessionID = event.sessionKey
         let result = store.apply(event)
-        if needsReply, let request = event.request {
-            guard result.changed, store.sessions[sessionID]?.pendingRequests.contains(where: { $0.id == request.id }) == true else {
-                connection.reply(BridgeReply(status: "unavailable", requestID: request.id, message: "Stale request")); return
-            }
-            pending[requestKey(sessionID, request.id)] = Pending(sessionID: sessionID, requestID: request.id, connection: connection)
-            if autoExpand && !menuBarOnly && !showingSettings && !isSettingsWindowVisible && !isEditingText { selectedID = sessionID; expanded = true }
-        } else {
-            connection.reply(BridgeReply(status: "accepted"))
-            if result.changed && (event.kind == .approvalRequested || event.kind == .questionRequested),
-               autoExpand && !menuBarOnly && !showingSettings && !isSettingsWindowVisible && !isEditingText {
-                selectedID = sessionID; expanded = true
-            }
+        if result.changed && (event.kind == .approvalRequested || event.kind == .questionRequested),
+           autoExpand && !menuBarOnly && !showingSettings && !isSettingsWindowVisible && !isEditingText {
+            selectedID = sessionID; expanded = true
         }
-        reconcilePending()
-        if selectedID == nil { selectedID = sessionID }
+        if selectedID == nil, store.sessions[sessionID] != nil { selectedID = sessionID }
         if let completed = result.completedSessionID, let session = store.sessions[completed] {
             notifyCompletion(session)
             if autoExpand && !menuBarOnly && !showingSettings && !isSettingsWindowVisible && !isEditingText { selectedID = completed; expanded = true }
         }
     }
     private var isEditingText: Bool { NSApp.keyWindow?.firstResponder is NSTextView }
-    private func reconcilePending() {
-        for (key, waiting) in Array(pending) {
-            if store.sessions[waiting.sessionID]?.pendingRequests.contains(where: { $0.id == waiting.requestID }) != true {
-                waiting.connection.reply(BridgeReply(status: "unavailable", requestID: waiting.requestID, message: "Request no longer active"))
-                pending.removeValue(forKey: key)
-            }
-        }
+    func removeSession(_ id: String) {
+        guard store.removeSession(id) else { return }
+        if selectedID == id { selectedID = sessions.first?.id }
     }
-    private func expirePending() {
-        for (key, waiting) in Array(pending) {
-            if !waiting.connection.isConnected || Date().timeIntervalSince(waiting.connection.createdAt) > 120 {
-                waiting.connection.reply(BridgeReply(status: "unavailable", requestID: waiting.requestID, message: "Return to the agent to continue"))
-                _ = store.cancelRequest(sessionID: waiting.sessionID, requestID: waiting.requestID)
-                pending.removeValue(forKey: key)
-                statusMessage = "请求已回到原 Agent 处理"
-            }
-        }
-    }
-    func respond(session: SessionState, request: AgentRequest, decision: String, answer: String? = nil) {
-        guard (request.kind == .approval && ["allow", "deny"].contains(decision)) ||
-              (request.kind == .question && decision == "answer" && !(answer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { return }
-        let key = requestKey(session.id, request.id)
-        guard demo || pending[key]?.connection.isConnected == true else {
-            _ = store.cancelRequest(sessionID: session.id, requestID: request.id)
-            pending.removeValue(forKey: key)
-            statusMessage = "请求已失效，请回到原 Agent。"; return
-        }
-        guard store.sessions[session.id]?.pendingRequests.contains(where: { $0.id == request.id }) == true else { return }
-        if !demo {
-            guard let waiting = pending.removeValue(forKey: key),
-                  waiting.connection.reply(BridgeReply(status: "resolved", requestID: request.id, decision: decision, answer: answer)) else {
-                _ = store.cancelRequest(sessionID: session.id, requestID: request.id)
-                statusMessage = "回传失败，请在原 Agent 中处理。"; return
-            }
-        }
-        guard store.resolve(sessionID: session.id, requestID: request.id, decision: decision, answer: answer) else { return }
-        showTransientStatus(decision == "deny" ? "已拒绝请求" : decision == "answer" ? "回答已发送" : "已允许本次请求")
-        if demo && decision != "deny" {
-            let task = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard !Task.isCancelled, let self else { return }
-                self.applyDemo(provider: session.provider, kind: .turnCompleted, message: "任务已完成，测试全部通过。")
-            }
-            demoTasks.append(task)
+    func clearCompletedSessions() {
+        let completedIDs = sessions.filter { $0.status == .completed }.map(\.id)
+        guard !completedIDs.isEmpty else { return }
+        var updatedStore = store
+        for id in completedIDs { updatedStore.removeSession(id) }
+        store = updatedStore
+        if let selectedID, completedIDs.contains(selectedID) {
+            self.selectedID = sessions.first?.id
         }
     }
     func jump(_ session: SessionState) {
@@ -308,11 +252,11 @@ final class AppModel: ObservableObject {
         guard case .sessionExtension(let resource)? = AdapterRegistry.adapter(for: provider)?.descriptor.injection else { return }
         let command = "\(provider.rawValue) -e " + shellQuote(integrationsDirectory.appendingPathComponent(resource).path)
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(command, forType: .string)
-        integrationOutput = "已复制：\(command)\n工具审批为可选参数 --island-approve-tools。"
+        integrationOutput = "已复制：\(command)\n仅展示进度；审批和回答请在原 Agent 中处理。"
     }
     private func shellQuote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     func loadDemo() {
-        demoTasks.forEach { $0.cancel() }; demoTasks.removeAll(); store.reset()
+        store.reset()
         applyDemo(provider: .claude, kind: .turnStarted, message: "修复登录校验")
         applyDemo(provider: .codex, kind: .turnStarted, message: "优化订单查询")
         applyDemo(provider: .pi, kind: .turnStarted, message: "补齐测试用例")
@@ -320,13 +264,68 @@ final class AppModel: ObservableObject {
         applyDemo(provider: .pi, kind: .questionRequested, message: "选择测试数据", request: AgentRequest(id: "demo-question", kind: .question, title: "测试数据采用哪种方案？", options: [RequestOption(id: "mock", label: "沿用现有 mock 数据"), RequestOption(id: "db", label: "使用独立测试数据库")]))
         selectedID = "claude:demo-claude"; statusMessage = ""
     }
+    #if DEBUG
+    /// Layout-only fixtures: no sockets, hooks, or real Agent requests.
+    @discardableResult
+    func loadSessionLayoutSnapshot(_ scene: String) -> Bool {
+        guard demo, ["sessionList", "sessionDetail", "sessionOverflow"].contains(scene) else { return false }
+        feedbackTask?.cancel()
+        store.reset()
+        selectedID = nil
+        statusMessage = ""
+        let now = Date().timeIntervalSince1970
+        let longSummary = "正在调整会话面板的宽度、卡片边界和信息层级，让同一项目中的多个任务也能清楚区分。\n已完成标题、运行状态和操作按钮的重新排列，接下来检查长文本在不同窗口宽度下的换行与完整展示。\n同时验证完整摘要、待审批请求和较多会话的滚动位置，确保最后一项的内容与按钮都能完整显示。"
+        func add(_ id: String, provider: AgentProvider = .codex, title: String,
+                 project: String = "CodeLand", kind: EventKind, message: String,
+                 age: Double, request: AgentRequest? = nil) {
+            _ = store.apply(AgentEvent(id: "snapshot-\(id)", provider: provider, sessionID: id,
+                                       turnID: "layout-snapshot", timestamp: now - age, kind: kind,
+                                       title: title, cwd: "/projects/\(project)", message: message,
+                                       terminal: TerminalTarget(appBundleID: provider == .codex ? "com.openai.codex" : "com.googlecode.iterm2"),
+                                       request: request))
+        }
+        switch scene {
+        case "sessionList":
+            add("layout-approval", provider: .claude, title: "验证登录流程与权限提示", project: "web-app",
+                kind: .approvalRequested, message: "等待允许执行登录模块的回归测试。", age: 10,
+                request: AgentRequest(id: "layout-approval-request", kind: .approval,
+                                      title: "允许执行登录模块回归测试？",
+                                      detail: "npm run test -- --runInBand src/auth/login.test.ts src/auth/permissions.test.ts --coverage"))
+            add("layout-working", title: "调整多会话面板的布局、信息层级与长标题展示，覆盖浮条、菜单栏和顶部刘海三种模式",
+                kind: .turnStarted, message: longSummary, age: 25)
+            add("layout-completed", provider: .pi, title: "补齐订单查询的边界测试", project: "api-server",
+                kind: .turnCompleted, message: "已补充分页与空结果测试，所有测试通过。", age: 120)
+            add("layout-failed", title: "检查构建与资源打包", kind: .turnFailed,
+                message: "构建失败：资源目录缺少应用图标，需要返回会话继续处理。", age: 300)
+            add("layout-disconnected", title: "新会话", kind: .sessionEnded,
+                message: "Codex 会话已结束", age: 600)
+        case "sessionDetail":
+            add("layout-working", title: "调整会话面板布局与信息层级", kind: .turnStarted,
+                message: "正在检查卡片间距、会话标题和操作按钮的排列。", age: 5)
+            add("layout-disconnected", title: "新会话", kind: .sessionEnded,
+                message: "Codex 会话已结束", age: 15)
+            selectedID = "codex:layout-disconnected"
+        case "sessionOverflow":
+            let titles = ["调整面板宽度", "整理会话信息层级", "检查长标题显示", "验证审批操作",
+                          "检查浮条展开位置", "整理完成状态", "验证卡片边界", "检查列表末项的完整内容与长摘要"]
+            for (index, title) in titles.enumerated() {
+                add("layout-overflow-\(index)", title: title,
+                    kind: index == 5 ? .turnCompleted : .turnStarted,
+                    message: index == titles.count - 1 ? longSummary : "正在验证\(title)，保持状态、摘要和操作区域清晰可见。",
+                    age: Double(index * 60 + 5))
+            }
+            selectedID = "codex:layout-overflow-7"
+        default: break
+        }
+        return true
+    }
+    #endif
     private func applyDemo(provider: AgentProvider, kind: EventKind, message: String, request: AgentRequest? = nil) {
         let event = AgentEvent(id: UUID().uuidString, provider: provider, sessionID: "demo-\(provider.rawValue)", turnID: "demo-turn", timestamp: Date().timeIntervalSince1970, kind: kind, title: provider == .claude ? "修复登录校验" : provider == .codex ? "优化订单查询" : "补齐测试用例", cwd: "/projects/\(provider == .claude ? "web-app" : provider == .codex ? "api-server" : "test-suite")", message: message, request: request)
         _ = store.apply(event)
     }
     func shutdown() {
-        cleanup?.invalidate(); demoTasks.forEach { $0.cancel() }; feedbackTask?.cancel()
-        for waiting in pending.values { waiting.connection.reply(BridgeReply(status: "unavailable", requestID: waiting.requestID, message: "Agent Island is closing")) }
-        pending.removeAll(); server?.stop()
+        feedbackTask?.cancel()
+        server?.stop()
     }
 }

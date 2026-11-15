@@ -90,6 +90,18 @@ final class TestSocketClient: @unchecked Sendable {
 func testSocketPath() -> String { "/tmp/agent-island-test-\(UUID().uuidString).sock" }
 
 final class SocketServerTests: XCTestCase {
+    func testAcknowledgementToAnAlreadyClosedObserverIsHarmless() throws {
+        var pair: [Int32] = [-1, -1]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else {
+            throw SocketTestError.syscall("socketpair", errno)
+        }
+        Darwin.close(pair[1])
+        // No SO_NOSIGPIPE setup: the send itself must handle a vanished reader.
+        let connection = EventConnection(pair[0])
+        XCTAssertFalse(connection.reply(BridgeReply(status: "accepted")))
+        XCTAssertFalse(connection.reply(BridgeReply(status: "accepted")))
+    }
+
     func testValidEventRoundtripAndSocketPermissions() throws {
         let expected = AgentEvent(provider: .claude, sessionID: "session", kind: .turnStarted, title: "中文标题")
         let received = expectation(description: "Decoded event")
@@ -190,29 +202,18 @@ final class SocketServerTests: XCTestCase {
         }
     }
 
-    func testConnectionCanWaitForExplicitDecision() throws {
-        let received = expectation(description: "Approval received")
-        let replied = expectation(description: "Decision sent")
+    func testPromptConnectionReceivesOnlyReceiptAcknowledgement() throws {
         let request = AgentRequest(id: "request-123", kind: .approval, title: "Run tests?")
         let server = SocketServer(path: testSocketPath()) { event, connection in
             XCTAssertEqual(event.request?.id, request.id)
-            received.fulfill()
-            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(50)) {
-                XCTAssertTrue(connection.isConnected)
-                connection.reply(BridgeReply(status: "resolved", requestID: request.id, decision: "deny"))
-                XCTAssertFalse(connection.isConnected)
-                replied.fulfill()
-            }
+            XCTAssertTrue(connection.reply(BridgeReply(status: "accepted")))
+            XCTAssertFalse(connection.reply(BridgeReply(status: "accepted")), "Each event closes after its acknowledgement")
         }
         try server.start()
         defer { server.stop() }
         let client = try TestSocketClient(path: server.path)
         defer { client.close() }
         try client.send(AgentEvent(provider: .claude, sessionID: "s", kind: .approvalRequested, request: request))
-        let reply = try client.readReply()
-        XCTAssertEqual(reply.status, "resolved")
-        XCTAssertEqual(reply.requestID, request.id)
-        XCTAssertEqual(reply.decision, "deny")
-        wait(for: [received, replied], timeout: 2)
+        XCTAssertEqual(try client.readReply(), BridgeReply(status: "accepted"))
     }
 }

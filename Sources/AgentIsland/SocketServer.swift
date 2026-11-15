@@ -15,19 +15,11 @@ enum SocketFailure: LocalizedError {
     }
 }
 
-/// One newline-delimited request/reply connection. Never executes incoming commands.
+/// One newline-delimited event/acknowledgement connection. Never executes incoming commands.
 final class EventConnection: @unchecked Sendable {
     private let lock = NSLock()
     private var descriptor: Int32
-    let createdAt = Date()
     init(_ descriptor: Int32) { self.descriptor = descriptor }
-    var isConnected: Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard descriptor >= 0 else { return false }
-        var byte: UInt8 = 0
-        let count = recv(descriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
-        return count > 0 || (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-    }
     @discardableResult
     func reply(_ response: BridgeReply) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -39,7 +31,9 @@ final class EventConnection: @unchecked Sendable {
             guard let base = bytes.baseAddress else { return false }
             var offset = 0
             while offset < data.count {
-                let written = Darwin.send(descriptor, base.advanced(by: offset), data.count - offset, 0)
+                // Publishers close immediately after writing. Suppress SIGPIPE
+                // per send, even if the peer closed before socket setup finished.
+                let written = Darwin.send(descriptor, base.advanced(by: offset), data.count - offset, MSG_NOSIGNAL)
                 if written < 0 && errno == EINTR { continue }
                 guard written > 0 else { return false }
                 offset += written

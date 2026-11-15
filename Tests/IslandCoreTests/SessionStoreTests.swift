@@ -28,7 +28,7 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(AgentEvent.self, from: JSONEncoder().encode(decoded)), decoded)
     }
 
-    func testReplyPreservesExactRequestAndAnswer() throws {
+    func testLegacyReplyDecodingPreservesCompatibility() throws {
         let reply = BridgeReply(status: "resolved", requestID: "question:3", decision: "answer", answer: "测试数据库 🧪")
         XCTAssertEqual(try JSONDecoder().decode(BridgeReply.self, from: JSONEncoder().encode(reply)), reply)
     }
@@ -48,7 +48,7 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(store.sessions.count, 2)
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsApproval)
         XCTAssertEqual(store.sessions["codex:s1"]?.status, .working)
-        XCTAssertFalse(store.resolve(sessionID: "codex:s1", requestID: "r1", decision: "allow"))
+        XCTAssertFalse(store.cancelRequest(sessionID: "codex:s1", requestID: "r1"))
     }
 
     func testDuplicateCompletionNotifiesOnlyOnce() {
@@ -59,6 +59,42 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertFalse(store.apply(done).changed)
         XCTAssertNil(store.apply(event(.turnCompleted, at: 3)).completedSessionID)
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .completed)
+    }
+
+    func testRemovingSessionOnlyRemovesItsProviderScopedRecord() {
+        var store = SessionStore()
+        store.apply(event(.approvalRequested, provider: .claude, request: approval()))
+        store.apply(event(.questionRequested, provider: .codex, request: question()))
+        let otherSession = store.sessions["codex:s1"]
+
+        XCTAssertTrue(store.removeSession("claude:s1"))
+        XCTAssertNil(store.sessions["claude:s1"])
+        XCTAssertEqual(store.sessions["codex:s1"], otherSession)
+        XCTAssertFalse(store.removeSession("claude:s1"))
+        XCTAssertFalse(store.cancelRequest(sessionID: "claude:s1", requestID: "r1"))
+    }
+
+    func testRemovedRecordRejectsDuplicateReplayAndAcceptsFreshActivity() {
+        var store = SessionStore()
+        let completed = event(.turnCompleted, at: 2, id: "done")
+        store.apply(completed)
+        store.removeSession("claude:s1")
+
+        XCTAssertFalse(store.apply(completed).changed)
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertTrue(store.apply(event(.turnStarted, at: 3, turn: "t2")).changed)
+        XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
+        XCTAssertEqual(store.sessions["claude:s1"]?.turnID, "t2")
+    }
+
+    func testRemovingRecordClearsItsPriorTerminalActivity() {
+        var store = SessionStore()
+        store.apply(event(.turnCompleted, at: 2))
+        store.removeSession("claude:s1")
+
+        XCTAssertTrue(store.apply(event(.toolStarted, at: 3, message: "Fresh host activity")).changed)
+        XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
+        XCTAssertEqual(store.sessions["claude:s1"]?.message, "Fresh host activity")
     }
 
     func testLateTurnCannotOverwriteNewTurnEvenWithNewerTimestamp() {
@@ -90,30 +126,28 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(store.apply(event(.turnCompleted, at: 6, turn: "t2")).completedSessionID, "claude:s1")
     }
 
-    func testPendingRequestsSurviveToolEventsAndCompletion() {
+    func testHostProgressClearsObservedRequestsAndCompletionNotifies() {
         var store = SessionStore()
         store.apply(event(.turnStarted))
         store.apply(event(.questionRequested, at: 2, request: question()))
         store.apply(event(.toolStarted, at: 3))
-        XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsInput)
+        XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
+        XCTAssertTrue(store.sessions["claude:s1"]?.pendingRequests.isEmpty == true)
         store.apply(event(.approvalRequested, at: 4, request: approval()))
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsApproval)
-        XCTAssertNil(store.apply(event(.turnCompleted, at: 5)).completedSessionID)
-        XCTAssertEqual(store.sessions["claude:s1"]?.pendingRequests.count, 2)
-        XCTAssertTrue(store.resolve(sessionID: "claude:s1", requestID: "r1", decision: "allow"))
-        XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsInput)
-        XCTAssertTrue(store.resolve(sessionID: "claude:s1", requestID: "q1", decision: "answer", answer: "mock"))
+        XCTAssertEqual(store.apply(event(.turnCompleted, at: 5)).completedSessionID, "claude:s1")
+        XCTAssertTrue(store.sessions["claude:s1"]?.pendingRequests.isEmpty == true)
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .completed)
     }
 
-    func testRequestDeduplicationAndStaleReplayAfterResolution() {
+    func testRequestDeduplicationAndStaleReplayAfterHostProgress() {
         var store = SessionStore()
         store.apply(event(.approvalRequested, request: approval()))
         store.apply(event(.approvalRequested, at: 2, request: approval()))
         XCTAssertEqual(store.sessions["claude:s1"]?.pendingRequests.count, 1)
-        XCTAssertTrue(store.resolve(sessionID: "claude:s1", requestID: "r1", decision: "deny"))
-        XCTAssertFalse(store.resolve(sessionID: "claude:s1", requestID: "r1", decision: "allow"))
-        XCTAssertFalse(store.apply(event(.approvalRequested, at: 3, request: approval())).changed)
+        store.apply(event(.toolFinished, at: 3))
+        XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
+        XCTAssertFalse(store.apply(event(.approvalRequested, at: 4, request: approval())).changed)
         XCTAssertTrue(store.sessions["claude:s1"]?.pendingRequests.isEmpty == true)
     }
 
@@ -123,17 +157,18 @@ final class SessionStoreTests: XCTestCase {
         store.apply(event(.turnStarted, at: 2, turn: "t2"))
         XCTAssertTrue(store.sessions["claude:s1"]?.pendingRequests.isEmpty == true)
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
-        XCTAssertFalse(store.resolve(sessionID: "claude:s1", requestID: "r1", decision: "allow"))
+        XCTAssertFalse(store.cancelRequest(sessionID: "claude:s1", requestID: "r1"))
     }
 
-    func testQuestionRequiresNonemptyAnswerAndCorrectDecision() {
-        var store = SessionStore()
-        store.apply(event(.questionRequested, request: question()))
-        XCTAssertFalse(store.resolve(sessionID: "claude:s1", requestID: "q1", decision: "allow"))
-        XCTAssertFalse(store.resolve(sessionID: "claude:s1", requestID: "q1", decision: "answer", answer: " \n "))
-        XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsInput)
-        XCTAssertTrue(store.resolve(sessionID: "claude:s1", requestID: "q1", decision: "answer", answer: "Use mock data"))
-        XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
+    func testEachProgressEventClearsQuestionsWithoutAnAnswerChannel() {
+        for kind in [EventKind.toolStarted, .toolFinished, .turnStarted] {
+            var store = SessionStore()
+            store.apply(event(.questionRequested, request: question()))
+            XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsInput)
+            store.apply(event(kind, at: 2))
+            XCTAssertEqual(store.sessions["claude:s1"]?.status, .working, kind.rawValue)
+            XCTAssertTrue(store.sessions["claude:s1"]?.pendingRequests.isEmpty == true, kind.rawValue)
+        }
     }
 
     func testCancelOnlyRemovesDisconnectedRequestAndNeverApprovesIt() {
@@ -199,7 +234,7 @@ final class SessionStoreTests: XCTestCase {
         store.apply(event(.requestCancelled, at: 3, request: approval("a")))
         XCTAssertEqual(store.sessions["claude:s1"]?.pendingRequests.map(\.id), ["q"])
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsInput)
-        XCTAssertFalse(store.resolve(sessionID: "claude:s1", requestID: "a", decision: "allow"))
+        XCTAssertFalse(store.cancelRequest(sessionID: "claude:s1", requestID: "a"))
         XCTAssertFalse(store.apply(event(.requestCancelled, at: 4, request: approval("missing"))).changed)
         XCTAssertEqual(store.sessions["claude:s1"]?.lastEventAt, 3)
         XCTAssertFalse(store.apply(event(.requestCancelled, at: 5, session: "unknown", request: approval("a"))).changed)
@@ -229,7 +264,7 @@ final class SessionStoreTests: XCTestCase {
         var store = SessionStore()
         store.apply(event(.questionRequested, request: question()))
         store.apply(event(.turnCompleted, at: 2, message: "Finished result"))
-        XCTAssertTrue(store.cancelRequest(sessionID: "claude:s1", requestID: "q1"))
+        XCTAssertFalse(store.cancelRequest(sessionID: "claude:s1", requestID: "q1"))
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .completed)
         XCTAssertEqual(store.sessions["claude:s1"]?.message, "Finished result")
 
@@ -262,9 +297,9 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertFalse(store.apply(event(.approvalRequested, at: 5, turn: "old", request: approval("old-turn"))).changed)
         XCTAssertFalse(store.apply(event(.approvalRequested, at: 5, turn: "unknown", request: approval("unknown-turn"))).changed)
         XCTAssertTrue(store.apply(event(.approvalRequested, at: 5, turn: "current", request: approval("valid"))).changed)
-        XCTAssertTrue(store.resolve(sessionID: "claude:s1", requestID: "valid", decision: "allow"))
+        store.apply(event(.toolFinished, at: 11, turn: "current"))
         XCTAssertFalse(store.apply(event(.approvalRequested, at: 6, turn: "current", request: approval("valid"))).changed)
-        XCTAssertEqual(store.sessions["claude:s1"]?.lastEventAt, 10)
+        XCTAssertEqual(store.sessions["claude:s1"]?.lastEventAt, 11)
     }
 
     func testOutOfOrderCancellationUsesPendingKindAndPreservesWatermark() {
@@ -279,6 +314,36 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(store.sessions["claude:s1"]?.lastEventAt, 10)
         store.apply(event(.toolFinished, at: 11))
         XCTAssertEqual(store.sessions["claude:s1"]?.status, .working)
+    }
+
+    func testDelayedPromptCannotRestoreWaitingAfterLaterProgress() {
+        for kind in [EventKind.toolStarted, .toolFinished, .turnCompleted, .turnFailed, .sessionEnded] {
+            var store = SessionStore()
+            store.apply(event(.turnStarted, at: 1))
+            store.apply(event(kind, at: 10))
+            XCTAssertFalse(store.apply(event(.approvalRequested, at: 5, request: approval("late"))).changed, kind.rawValue)
+            XCTAssertFalse(store.apply(event(.questionRequested, at: 6, message: "Old host prompt")).changed, kind.rawValue)
+            XCTAssertTrue(store.sessions["claude:s1"]?.pendingRequests.isEmpty == true, kind.rawValue)
+        }
+    }
+
+    func testDelayedPreToolEventDoesNotClearNewerApproval() {
+        var store = SessionStore()
+        store.apply(event(.turnStarted, at: 1))
+        store.apply(event(.approvalRequested, at: 5, request: approval()))
+        XCTAssertFalse(store.apply(event(.toolStarted, at: 4)).changed)
+        XCTAssertEqual(store.sessions["claude:s1"]?.status, .needsApproval)
+        XCTAssertEqual(store.sessions["claude:s1"]?.pendingRequests.count, 1)
+    }
+
+    func testPromptsCannotReviveCompletedOrFailedTurn() {
+        for kind in [EventKind.turnCompleted, .turnFailed, .sessionEnded] {
+            var store = SessionStore()
+            store.apply(event(.turnStarted, at: 1))
+            store.apply(event(kind, at: 2))
+            XCTAssertFalse(store.apply(event(.approvalRequested, at: 3, request: approval())).changed, kind.rawValue)
+            XCTAssertFalse(store.apply(event(.questionRequested, at: 4)).changed, kind.rawValue)
+        }
     }
 
     func testBoundedDedupHistoryAndReset() {

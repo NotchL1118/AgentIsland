@@ -20,8 +20,8 @@ final class ClaudeAdapterTests: XCTestCase {
 
     let adapter = ClaudeAdapter()
 
-    func testNormalToolNeverGrantsPermission() {
-        XCTAssertNil(adapter.decide(payload(), waiting: false, context: context()))
+    func testNormalToolOnlyPublishesStatus() {
+        XCTAssertNil(adapter.handle(payload(), waiting: false, context: context()))
         XCTAssertEqual(sent.first?.0.kind, .toolStarted)
         XCTAssertNil(sent.first?.0.request)
     }
@@ -39,38 +39,23 @@ final class ClaudeAdapterTests: XCTestCase {
         XCTAssertEqual(adapter.event(for: payload("StopFailure"), context: context())?.kind, .turnFailed)
     }
 
-    func testExplicitAllowOnly() throws {
-        reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: "allow") }
-        let output = try XCTUnwrap(adapter.decide(payload("PermissionRequest"), waiting: true, context: context()))
-        XCTAssertEqual(sent.first?.1, 120)
-        let decision = (output["hookSpecificOutput"] as? [String: Any])?["decision"] as? [String: Any]
-        XCTAssertEqual(decision?["behavior"] as? String, "allow")
-    }
-
-    func testDenyAddsNoPersistentPermission() throws {
-        let output = try XCTUnwrap(ClaudeAdapter.permissionOutput(requestID: "r", reply: BridgeReply(status: "resolved", requestID: "r", decision: "deny")))
-        let decision = (output["hookSpecificOutput"] as? [String: Any])?["decision"] as? [String: Any]
-        XCTAssertEqual(decision?["behavior"] as? String, "deny")
-        XCTAssertNil(decision?["updatedPermissions"])
-    }
-
-    func testUnmatchedOrUnresolvedRepliesNeverApprove() {
-        for candidate: BridgeReply? in [nil, BridgeReply(status: "resolved", decision: "allow"),
-                                        BridgeReply(status: "resolved", requestID: "wrong", decision: "allow"),
-                                        BridgeReply(status: "accepted", requestID: "r", decision: "allow"),
-                                        BridgeReply(status: "resolved", requestID: "r", decision: "always")] {
-            XCTAssertNil(ClaudeAdapter.permissionOutput(requestID: "r", reply: candidate))
+    func testLegacyWaitAndAppRepliesCannotApproveOrDeny() {
+        for waiting in [false, true] {
+            for decision in ["allow", "deny", "answer"] {
+                sent = []
+                reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: decision, answer: "A") }
+                XCTAssertNil(adapter.handle(payload("PermissionRequest"), waiting: waiting, context: context()))
+                XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested])
+                XCTAssertEqual(sent.first?.0.request?.detail, "npm test")
+                XCTAssertEqual(sent.first?.1, 0.05, "Permission observations use the same short send deadline as status")
+            }
         }
     }
 
-    func testUnavailableCancelsCardButDuplicateDoesNot() {
+    func testUnavailableObserverLeavesNativeApprovalUntouched() {
         reply = { _ in nil }
-        XCTAssertNil(adapter.decide(payload("PermissionRequest"), waiting: true, context: context()))
-        XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested, .requestCancelled])
-        sent = []
-        reply = { BridgeReply(status: "duplicate", requestID: $0.request?.id) }
-        XCTAssertNil(adapter.decide(payload("PermissionRequest"), waiting: true, context: context()))
-        XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested])
+        XCTAssertNil(adapter.handle(payload("PermissionRequest"), waiting: true, context: context()))
+        XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested], "No cancellation or replacement approval is injected")
     }
 
     func questionPayload(_ questions: [[String: Any]]) -> [String: Any] {
@@ -78,62 +63,50 @@ final class ClaudeAdapterTests: XCTestCase {
                                "tool_input": ["questions": questions, "metadata": ["keep": true]]])
     }
 
-    func testQuestionAnswersPreserveEntireToolInput() throws {
-        reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: "answer", answer: " Mock ") }
-        let output = try XCTUnwrap(adapter.decide(questionPayload([["question": "Which DB?", "options": [["label": "Mock"]]]]), waiting: true, context: context()))
-        let specific = output["hookSpecificOutput"] as? [String: Any]
-        let updated = specific?["updatedInput"] as? [String: Any]
-        XCTAssertEqual(specific?["permissionDecision"] as? String, "allow")
-        XCTAssertEqual((updated?["answers"] as? [String: String])?["Which DB?"], "Mock")
-        XCTAssertEqual((updated?["metadata"] as? [String: Bool])?["keep"], true)
-        XCTAssertEqual(sent.first?.0.request?.options?.map(\.label), ["Mock"])
-    }
-
-    func testAsyncRegistrationNeverAnswersQuestions() {
-        XCTAssertNil(adapter.decide(questionPayload([["question": "Which DB?"]]), waiting: false, context: context()))
-        XCTAssertTrue(sent.isEmpty)
-    }
-
-    func testPartialQuestionFailureDoesNotRewriteInput() {
-        var calls = 0
-        reply = { event in
-            calls += 1
-            return calls == 1 ? BridgeReply(status: "resolved", requestID: event.request?.id, decision: "answer", answer: "A") : nil
+    func testQuestionsRemainReadOnlyIncludingMultiSelectAndLegacyWait() {
+        let input = questionPayload([
+            ["question": "Which DB?", "options": [["label": "Mock"]]],
+            ["question": "Pick", "multiSelect": true, "options": [["label": "A"], ["label": "B"]]]
+        ])
+        for waiting in [false, true] {
+            sent = []
+            reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: "answer", answer: "Mock") }
+            XCTAssertNil(adapter.handle(input, waiting: waiting, context: context()), "Never return updatedInput or permissionDecision")
+            XCTAssertEqual(sent.map(\.0.kind), [.questionRequested, .questionRequested])
+            XCTAssertEqual(sent.map { $0.0.request?.id }, ["call-1:question:0", "call-1:question:1"])
+            XCTAssertEqual(sent.first?.0.request?.title, "Which DB?")
+            XCTAssertEqual(sent.first?.0.request?.options?.map(\.label), ["Mock"])
+            XCTAssertEqual(sent.last?.0.request?.options?.map(\.label), ["A", "B"])
+            XCTAssertTrue(sent.allSatisfy { $0.1 == 0.05 })
         }
-        XCTAssertNil(adapter.decide(questionPayload([["question": "One?"], ["question": "Two?"]]), waiting: true, context: context()))
-        XCTAssertEqual(sent.last?.0.kind, .requestCancelled)
     }
 
-    func testMultiSelectUsesOriginalUI() {
-        XCTAssertNil(adapter.decide(questionPayload([["question": "Pick", "multiSelect": true]]), waiting: true, context: context()))
-        XCTAssertEqual(sent.count, 1)
-        XCTAssertNil(sent[0].0.request)
-    }
-
-    func testInteractiveToolsDoNotReceiveBareAllow() {
+    func testInteractivePermissionNotificationsNeverAnswer() {
         reply = { _ in BridgeReply(status: "resolved", requestID: "x", decision: "allow") }
         for tool in ["AskUserQuestion", "ExitPlanMode"] {
-            XCTAssertNil(adapter.decide(payload("PermissionRequest", ["tool_name": tool]), waiting: true, context: context()))
+            XCTAssertNil(adapter.handle(payload("PermissionRequest", ["tool_name": tool]), waiting: true, context: context()))
         }
-        XCTAssertTrue(sent.allSatisfy { $0.0.kind == .questionRequested && $0.0.request == nil })
+        XCTAssertTrue(sent.allSatisfy { $0.0.kind == .questionRequested })
     }
 
     func testMissingIdentityIsIgnored() {
-        XCTAssertNil(adapter.decide(["hook_event_name": "Stop"], waiting: false, context: context()))
+        XCTAssertNil(adapter.handle(["hook_event_name": "Stop"], waiting: false, context: context()))
         XCTAssertTrue(sent.isEmpty)
     }
 }
 
 final class CodexAdapterTests: XCTestCase {
-    var sent: [AgentEvent] = []
+    var sent: [(AgentEvent, TimeInterval)] = []
     var reply: (AgentEvent) -> BridgeReply? = { _ in BridgeReply(status: "accepted") }
     func context(_ env: [String: String] = [:]) -> HookContext {
-        HookContext(environment: env, send: { [unowned self] event, _ in sent.append(event); return reply(event) }, terminal: { nil }, now: { 1 })
+        HookContext(environment: env, send: { [unowned self] event, timeout in
+            sent.append((event, timeout)); return reply(event)
+        }, terminal: { nil }, now: { 1 })
     }
     let adapter = CodexAdapter()
 
     func testLifecycleMappingAndCompaction() {
-        for (hook, kind) in CodexAdapter.mapping where hook != "PermissionRequest" {
+        for (hook, kind) in CodexAdapter.mapping {
             XCTAssertEqual(adapter.event(for: ["hook_event_name": hook, "session_id": "s"], context: context())?.kind, kind)
         }
         let compact = adapter.event(for: ["hook_event_name": "SessionStart", "session_id": "s", "source": "compact"], context: context())
@@ -148,20 +121,25 @@ final class CodexAdapterTests: XCTestCase {
         XCTAssertEqual(adapter.handle(["hook_event_name": "Stop", "session_id": "s"], waiting: false, context: context()), "{}")
     }
 
-    func testAllowUsesDocumentedShapeAndDenyStaysDeny() throws {
-        reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: "allow") }
-        let allow = adapter.run(["hook_event_name": "PermissionRequest", "session_id": "s"], context: context())
-        XCTAssertEqual(((allow["hookSpecificOutput"] as? [String: Any])?["decision"] as? [String: Any])?["behavior"] as? String, "allow")
-        reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: "deny") }
-        let deny = adapter.run(["hook_event_name": "PermissionRequest", "session_id": "s"], context: context())
-        XCTAssertEqual(((deny["hookSpecificOutput"] as? [String: Any])?["decision"] as? [String: Any])?["behavior"] as? String, "deny")
+    func testLegacyApprovalSettingsAndAppRepliesCannotDecide() {
+        for waiting in [false, true] {
+            for decision in ["allow", "deny", "answer"] {
+                sent = []
+                reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: decision, answer: "A") }
+                XCTAssertEqual(adapter.handle(["hook_event_name": "PermissionRequest", "session_id": "s",
+                                               "tool_input": ["command": "npm test"]], waiting: waiting,
+                                              context: context(["AGENT_ISLAND_APPROVAL_TIMEOUT": "120"])), "{}")
+                XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested])
+                XCTAssertEqual(sent.first?.0.request?.detail, "npm test")
+                XCTAssertEqual(sent.first?.1, 0.05)
+            }
+        }
     }
 
-    func testTimeoutReturnsControlToCodexAndCancelsCard() {
+    func testUnavailableObserverLeavesNativeApprovalUntouched() {
         reply = { _ in nil }
         XCTAssertEqual(adapter.handle(["hook_event_name": "PermissionRequest", "session_id": "s"], waiting: true, context: context()), "{}")
-        XCTAssertEqual(sent.map(\.kind), [.approvalRequested, .requestCancelled])
-        XCTAssertEqual(sent[0].request?.id, sent[1].request?.id)
+        XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested])
     }
 }
 
@@ -183,6 +161,14 @@ final class TerminalProbeTests: XCTestCase {
 }
 
 final class ProviderTests: XCTestCase {
+    func testEveryProviderIsObservationOnly() {
+        for adapter in AdapterRegistry.all {
+            XCTAssertTrue(adapter.descriptor.capabilities.status)
+            XCTAssertFalse(adapter.descriptor.capabilities.approval)
+            XCTAssertFalse(adapter.descriptor.capabilities.question)
+        }
+    }
+
     func testUnknownProvidersDecode() throws {
         let json = #"{"version":1,"id":"e","provider":"newagent","sessionID":"s","timestamp":1,"kind":"turnStarted"}"#
         let event = try JSONDecoder().decode(AgentEvent.self, from: Data(json.utf8))

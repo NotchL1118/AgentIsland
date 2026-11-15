@@ -6,6 +6,7 @@ public struct SessionStore: Sendable {
     public private(set) var sessions: [String: SessionState]
 
     private var activity: [String: SessionStatus] = [:]
+    private var lastProgressAt: [String: Double] = [:]
     private var retiredTurns: [String: [String]] = [:]
     private var resolvedRequests: Set<String> = []
     private var resolvedRequestOrder: [String] = []
@@ -48,7 +49,13 @@ public struct SessionStore: Sendable {
             return ApplyResult(changed: false)
         }
         let isOlder = event.timestamp < (previous?.lastEventAt ?? 0)
-        let isNewCurrentTurnRequest = (event.kind == .approvalRequested || event.kind == .questionRequested)
+        let isRequest = event.kind == .approvalRequested || event.kind == .questionRequested
+        // Late asynchronous prompts must not undo evidence that the host has
+        // already resumed work or finished the turn.
+        if isRequest, let progressAt = lastProgressAt[key], event.timestamp < progressAt {
+            return ApplyResult(changed: false)
+        }
+        let isNewCurrentTurnRequest = isRequest
             && event.turnID != nil && event.turnID == previous?.turnID
             && event.request != nil
             && previous?.pendingRequests.contains(where: { $0.id == event.request?.id }) == false
@@ -88,9 +95,9 @@ public struct SessionStore: Sendable {
             session.turnID = event.turnID
         }
 
-        // Tool telemetry received after a terminal outcome must not revive that
-        // turn. Only a subsequent turnStarted event can begin work again.
-        if (event.kind == .toolStarted || event.kind == .toolFinished),
+        // Tool telemetry and prompts received after a terminal outcome must not
+        // revive that turn. Only a subsequent turnStarted can begin work again.
+        if (event.kind == .toolStarted || event.kind == .toolFinished || isRequest),
            [.completed, .failed, .disconnected].contains(underlying) {
             return ApplyResult(changed: false)
         }
@@ -114,6 +121,10 @@ public struct SessionStore: Sendable {
         case .sessionStarted:
             if previous == nil || underlying == .disconnected { underlying = .idle }
         case .turnStarted, .toolStarted, .toolFinished:
+            // Requests describe the host's wait state; subsequent progress is
+            // evidence it was handled there, without a reply from Agent Island.
+            invalidatePending(&session)
+            lastProgressAt[key] = event.timestamp
             underlying = .working
         case .approvalRequested, .questionRequested:
             if let request = event.request {
@@ -124,8 +135,8 @@ public struct SessionStore: Sendable {
                 }
                 if underlying == .idle || underlying == .disconnected { underlying = .working }
             } else {
-                // A source may observe a prompt without owning its response
-                // channel. Show the wait state; the UI must route to the host.
+                // A source may observe a prompt without request details.
+                // Show the wait state; all responses belong to the host.
                 underlying = event.kind == .approvalRequested ? .needsApproval : .needsInput
             }
         case .requestCancelled:
@@ -135,17 +146,21 @@ public struct SessionStore: Sendable {
                 rememberResolved(requestID, session: key)
                 if !isTerminal(underlying) {
                     underlying = hostWaitingStatus(for: cancelled.kind, underlying: underlying)
-                    session.message = event.message ?? "请求已交回原 Agent，请返回原会话处理"
+                    session.message = event.message ?? "请在原 Agent 中处理此请求"
                 }
             }
         case .turnCompleted:
             underlying = .completed
+            invalidatePending(&session)
+            lastProgressAt[key] = event.timestamp
         case .turnFailed:
             underlying = .failed
             invalidatePending(&session)
+            lastProgressAt[key] = event.timestamp
         case .sessionEnded:
             underlying = .disconnected
             invalidatePending(&session)
+            lastProgressAt[key] = event.timestamp
         case .heartbeat:
             break
         }
@@ -159,37 +174,8 @@ public struct SessionStore: Sendable {
         return ApplyResult(changed: previous != session, completedSessionID: didComplete ? key : nil)
     }
 
-    /// sessionID is the namespaced SessionState.id, not the agent's raw ID.
-    /// The caller must deliver the reply through its original live connection.
-    @discardableResult
-    public mutating func resolve(sessionID: String, requestID: String, decision: String, answer: String? = nil) -> Bool {
-        guard var session = sessions[sessionID],
-              let index = session.pendingRequests.firstIndex(where: { $0.id == requestID }) else {
-            return false
-        }
-        let request = session.pendingRequests[index]
-        switch request.kind {
-        case .approval:
-            guard decision == "allow" || decision == "deny" else { return false }
-        case .question:
-            guard decision == "answer", let answer,
-                  !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        }
-
-        session.pendingRequests.remove(at: index)
-        rememberResolved(requestID, session: sessionID)
-        let underlying = activity[sessionID] ?? .working
-        session.status = visibleStatus(for: session, underlying: underlying)
-        if underlying != .completed && underlying != .failed {
-            session.message = decision == "answer" ? "已回答：\(answer ?? "")"
-                : decision == "allow" ? "已允许请求，等待 Agent 继续" : "已拒绝请求，等待 Agent 继续"
-        }
-        sessions[sessionID] = session
-        return true
-    }
-
-    /// Removes only the request whose response channel expired or disconnected.
-    /// A lost response channel is never interpreted as approval or task success.
+    /// Clears one observed request. Legacy cancellation can still indicate the
+    /// host is waiting; subsequent progress or an outcome clears that status.
     @discardableResult
     public mutating func cancelRequest(sessionID: String, requestID: String, waitingForHost: Bool = true) -> Bool {
         guard var session = sessions[sessionID],
@@ -201,7 +187,7 @@ public struct SessionStore: Sendable {
         var underlying = activity[sessionID] ?? .working
         if !isTerminal(underlying) {
             if waitingForHost { underlying = hostWaitingStatus(for: cancelled.kind, underlying: underlying) }
-            session.message = waitingForHost ? "请求已交回原 Agent，请返回原会话处理" : "请求已取消"
+            session.message = waitingForHost ? "请在原 Agent 中处理此请求" : "请求已取消"
         }
         activity[sessionID] = underlying
         session.status = visibleStatus(for: session, underlying: underlying)
@@ -218,9 +204,21 @@ public struct SessionStore: Sendable {
         sessions[sessionID] = session
     }
 
+    /// Removes the observed record without affecting its host. A fresh event
+    /// may recreate it; bounded replay history still rejects duplicate events.
+    @discardableResult
+    public mutating func removeSession(_ sessionID: String) -> Bool {
+        guard sessions.removeValue(forKey: sessionID) != nil else { return false }
+        activity.removeValue(forKey: sessionID)
+        lastProgressAt.removeValue(forKey: sessionID)
+        retiredTurns.removeValue(forKey: sessionID)
+        return true
+    }
+
     public mutating func reset() {
         sessions.removeAll()
         activity.removeAll()
+        lastProgressAt.removeAll()
         retiredTurns.removeAll()
         resolvedRequests.removeAll()
         resolvedRequestOrder.removeAll()

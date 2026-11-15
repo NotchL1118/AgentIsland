@@ -87,6 +87,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         var closedHeight: CGFloat
         var attached: Bool
         var preferredAnchor: CGPoint
+        var menuBarIconCenter: CGPoint?
+        var menuBarBottom: CGFloat?
         var visibleFrame: CGRect
         var presentation: IslandPresentation
     }
@@ -95,7 +97,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         NSApp.setActivationPolicy(.accessory)
         let demo = CommandLine.arguments.contains("--demo")
         #if DEBUG
-        isPresentationDiagnostic = demo && (CommandLine.arguments.contains("--snapshot") || CommandLine.arguments.contains("--presentation-checks"))
+        isPresentationDiagnostic = demo && (CommandLine.arguments.contains("--snapshot") || CommandLine.arguments.contains("--presentation-checks") || CommandLine.arguments.contains("--motion-checks"))
         #endif
         model = AppModel(demo: demo)
         if demo { model.selectedID = nil }
@@ -117,7 +119,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             self.motion.snap(to: self.model.expanded ? 1 : 0)
         }
         panel.dragDidEnd = { [weak self] in self?.finishFloatingDrag() }
-        surface = LiquidPanelView(rootView: IslandView(model: model, width: 800, height: 434, notchWidth: 0, notchHeight: 0))
+        surface = LiquidPanelView(rootView: IslandView(model: model, width: IslandView.expandedWidth, height: 434, notchWidth: 0, notchHeight: 0))
         panel.contentView = surface
         autoCollapse.context = { [weak self] in
             guard let self, !self.isPresentationDiagnostic else { return nil }
@@ -174,13 +176,16 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
                     model.settingsWindowSection = CommandLine.arguments[sceneIndex + 1] == "settingsWindowAgents" ? .agents : .general
                     presentSettingsWindow()
                     capturesSettingsWindow = true
-                default: break
+                default: _ = model.loadSessionLayoutSnapshot(CommandLine.arguments[sceneIndex + 1])
                 }
                 layoutPanel()
                 if model.menuBarOnly { model.expanded = true; layoutPanel() }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                 guard let self else { return }
+                // Status items acquire their screen position after launch.
+                // Refresh the real icon anchor before freezing a diagnostic frame.
+                self.layoutPanel()
                 if let progressIndex = CommandLine.arguments.firstIndex(of: "--snapshot-progress"), progressIndex + 1 < CommandLine.arguments.count,
                    let progress = Double(CommandLine.arguments[progressIndex + 1]) { self.motion.snap(to: progress) }
                 // Let SwiftUI commit the requested diagnostic frame before caching it.
@@ -220,6 +225,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         }
         if demo, let index = CommandLine.arguments.firstIndex(of: "--presentation-checks"), index + 1 < CommandLine.arguments.count {
             runPresentationChecks(to: CommandLine.arguments[index + 1])
+        }
+        if demo, let index = CommandLine.arguments.firstIndex(of: "--motion-checks"), index + 1 < CommandLine.arguments.count {
+            runMotionChecks(to: CommandLine.arguments[index + 1])
         }
         #endif
     }
@@ -289,6 +297,13 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         guard let button = statusItem.button, let window = button.window else { return nil }
         return window.convertToScreen(button.convert(button.bounds, to: nil))
     }
+    private func statusIconFrame() -> CGRect? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        // The pending-count title makes the button wider than its image.
+        let imageRect = button.cell?.imageRect(forBounds: button.bounds) ?? .zero
+        let rect = imageRect.isEmpty ? button.bounds : imageRect
+        return window.convertToScreen(button.convert(rect, to: nil))
+    }
     private func displayID(_ screen: NSScreen) -> String {
         let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
         if let number, let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue() {
@@ -344,24 +359,33 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         else { notchWidth = 0 }
         let notchHeight: CGFloat = hasNotch ? screen.safeAreaInsets.top : 0
         let availableHeight = screen.visibleFrame.height - 40
-        let width: CGFloat = min(800, screen.visibleFrame.width - 48)
-        let closedHeight: CGFloat = model.menuBarOnly ? 6 : max(notchHeight, 36)
+        let width: CGFloat = min(IslandView.expandedWidth, screen.visibleFrame.width - 48)
+        let closedHeight: CGFloat = model.menuBarOnly ? 0 : max(notchHeight, 36)
         let closedWidth: CGFloat = model.floating
             ? FloatingBarLayout(sessions: model.sessions, maximumWidth: width - 40).width
-            : model.menuBarOnly ? 28 : min(width - 40, hasNotch ? max(360, notchWidth + 160) : 300)
-        let desired = IslandView.contentHeight(for: model, notchHeight: notchHeight)
+            : model.menuBarOnly ? 0 : min(width - 40, hasNotch ? max(360, notchWidth + 160) : 300)
+        let desired = IslandView.contentHeight(for: model, notchHeight: notchHeight, width: width)
         let height = min(desired, availableHeight)
+        let menuBarIconCenter = model.menuBarOnly
+            ? statusIconFrame().map { CGPoint(x: $0.midX, y: $0.midY) } : nil
+        let menuBarButtonFrame = model.menuBarOnly ? statusButtonFrame() : nil
+        let menuBarBottom = model.menuBarOnly
+            ? min(menuBarButtonFrame?.minY ?? screen.visibleFrame.maxY, screen.visibleFrame.maxY) : nil
         let anchor: CGPoint
         if model.floating {
             anchor = floatingPosition?.anchor(in: screen.visibleFrame) ?? CGPoint(x: screen.visibleFrame.midX, y: screen.visibleFrame.maxY - 24)
             lastFloatingAnchor = anchor
-        } else if model.menuBarOnly, let rect = statusButtonFrame() {
-            anchor = CGPoint(x: rect.midX, y: min(rect.minY - 6, screen.visibleFrame.maxY - 6))
+        } else if let menuBarBottom {
+            anchor = CGPoint(x: menuBarIconCenter?.x ?? menuBarButtonFrame?.midX ?? screen.visibleFrame.midX,
+                             y: menuBarBottom - 6)
         } else {
             anchor = CGPoint(x: screen.frame.midX, y: hasNotch ? screen.frame.maxY : screen.visibleFrame.maxY - 6)
         }
-        layout = PanelLayout(width: width, height: height, notchWidth: notchWidth, notchHeight: notchHeight, closedWidth: closedWidth, closedHeight: closedHeight, attached: model.presentation == .notch, preferredAnchor: anchor, visibleFrame: screen.visibleFrame, presentation: model.presentation)
+        layout = PanelLayout(width: width, height: height, notchWidth: notchWidth, notchHeight: notchHeight, closedWidth: closedWidth, closedHeight: closedHeight, attached: model.presentation == .notch, preferredAnchor: anchor, menuBarIconCenter: menuBarIconCenter, menuBarBottom: menuBarBottom, visibleFrame: screen.visibleFrame, presentation: model.presentation)
         panel.allowsFreePosition = model.presentation != .notch
+        // Keep the icon above the intake; a separate clip also prevents the
+        // silhouette from showing through the translucent menu-bar background.
+        panel.level = model.menuBarOnly ? NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue - 1) : .statusBar
         if wasExpanded != model.expanded { autoCollapse.reset() }
         if wasExpanded && !model.expanded {
             // End editing before the controls become clipped and inaccessible.
@@ -369,22 +393,55 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             panel.resignKey()
         }
         wasExpanded = model.expanded
-        renderSurface(progress: motion.spring.value)
-        motion.setExpanded(model.expanded, reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        renderSurface(progress: motion.progress, updateContent: true)
+        motion.setExpanded(model.expanded, reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                           menuBar: model.menuBarOnly)
         if model.expanded || !model.menuBarOnly { panel.orderFrontRegardless() }
     }
-    private func renderSurface(progress: Double) {
+    private func renderSurface(progress: Double, updateContent: Bool = false) {
         guard let layout else { return }
-        let geometry = LiquidGeometry(fullWidth: layout.width, fullHeight: layout.height, closedWidth: layout.closedWidth, closedHeight: layout.closedHeight, progress: progress, attached: layout.attached)
-        if !panel.isUserDragging {
-            let anchor = layout.presentation == .notch ? layout.preferredAnchor : PanelPlacement.clampedAnchor(layout.preferredAnchor, visibleFrame: layout.visibleFrame, visibleSize: geometry.boundingRect.size)
-            let inset = LiquidPanelView.shadowInset
-            let frame = CGRect(x: anchor.x - layout.width / 2 - inset, y: anchor.y - layout.height - inset, width: layout.width + inset * 2, height: layout.height + inset)
-            if panel.frame != frame { panel.setFrame(frame, display: true) }
+        let inset = LiquidPanelView.shadowInset
+        let geometry: LiquidGeometry
+        var contentOrigin = CGPoint(x: inset, y: 0)
+        if layout.presentation == .menuBar, let iconCenter = layout.menuBarIconCenter {
+            // Place the expanded canvas once. The window and text stay put
+            // while the liquid mask closes toward the icon above the content.
+            let anchor = PanelPlacement.clampedAnchor(layout.preferredAnchor, visibleFrame: layout.visibleFrame,
+                                                       visibleSize: CGSize(width: layout.width, height: layout.height))
+            let left = anchor.x - layout.width / 2
+            let topInset = max(0, iconCenter.y - anchor.y) + inset
+            let frame = CGRect(x: left - inset, y: anchor.y - layout.height - inset,
+                               width: layout.width + inset * 2, height: layout.height + inset + topInset).integral
+            if !panel.isUserDragging, panel.frame != frame { panel.setFrame(frame, display: true) }
+            // Account for Window Server's rounding without moving the mask's
+            // target away from the actual (potentially fractional) image rect.
+            contentOrigin = CGPoint(x: left - panel.frame.minX, y: panel.frame.maxY - anchor.y)
+            let target = CGPoint(x: iconCenter.x - left, y: anchor.y - iconCenter.y)
+            geometry = LiquidGeometry(fullWidth: layout.width, fullHeight: layout.height, closedWidth: 0,
+                                      closedHeight: 0, progress: progress, attached: false, collapsePoint: target)
+        } else {
+            geometry = LiquidGeometry(fullWidth: layout.width, fullHeight: layout.height, closedWidth: layout.closedWidth,
+                                      closedHeight: layout.closedHeight, progress: progress, attached: layout.attached)
+            if !panel.isUserDragging {
+                let anchor = layout.presentation == .notch ? layout.preferredAnchor
+                    : PanelPlacement.clampedAnchor(layout.preferredAnchor, visibleFrame: layout.visibleFrame, visibleSize: geometry.boundingRect.size)
+                let frame = CGRect(x: anchor.x - layout.width / 2 - inset, y: anchor.y - layout.height - inset,
+                                   width: layout.width + inset * 2, height: layout.height + inset)
+                if panel.frame != frame { panel.setFrame(frame, display: true) }
+            }
         }
-        surface.update(rootView: IslandView(model: model, width: layout.width, height: layout.height, notchWidth: layout.notchWidth, notchHeight: layout.notchHeight, progress: min(1, max(0, progress))), geometry: geometry)
+        let isMenuBar = layout.presentation == .menuBar
+        surface.update(rootView: IslandView(model: model, width: layout.width, height: layout.height, notchWidth: layout.notchWidth, notchHeight: layout.notchHeight,
+                                           progress: isMenuBar ? 1 : min(1, max(0, progress))), geometry: geometry,
+                       contentOrigin: contentOrigin,
+                       shadowProgress: isMenuBar ? MenuBarCollapse.shadowProgress(progress: progress) : 1,
+                       surfaceOpacity: isMenuBar ? MenuBarCollapse.surfaceOpacity(progress: progress) : 1,
+                       updateContent: updateContent || !isMenuBar,
+                       contentOpacity: isMenuBar ? MenuBarCollapse.contentVisibility(progress: progress, index: 0) : 1,
+                       contentInteractive: !isMenuBar || model.expanded && progress > 0.92,
+                       menuBarClipTop: layout.menuBarBottom.map { panel.frame.maxY - $0 })
         updateMouseAcceptance()
-        if layout.presentation == .menuBar, !model.expanded, progress <= 0.0005 { panel.orderOut(nil) }
+        if layout.presentation == .menuBar, !model.expanded, progress <= 0 { panel.orderOut(nil) }
         autoCollapse.update()
     }
     private func finishFloatingDrag() {
@@ -431,7 +488,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         // The fixed canvas includes transparent space. Let clicks in that space
         // reach the desktop or another application, even while the mask moves.
         guard !panel.isUserDragging else { return }
-        panel.ignoresMouseEvents = !surface.containsScreenPoint(NSEvent.mouseLocation)
+        let point = NSEvent.mouseLocation
+        // The closing silhouette can overlap the icon. Its toggle must remain
+        // clickable, including when reversing a close partway through.
+        let overStatusItem = layout?.presentation == .menuBar && statusButtonFrame()?.contains(point) == true
+        panel.ignoresMouseEvents = overStatusItem || !surface.containsScreenPoint(point)
     }
     private func handlePointerEvent(_ event: NSEvent, at eventPoint: CGPoint? = nil) {
         let point = eventPoint ?? NSEvent.mouseLocation
@@ -474,6 +535,55 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     #if DEBUG
+    /// Measures the real timer + hosting view path rather than only stepping a
+    /// driver in a unit test. Uses demo sessions and never persists preferences.
+    private func runMotionChecks(to path: String) {
+        Task { @MainActor [self] in
+            model.setPresentation(.menuBar)
+            model.showingSettings = false
+            model.expanded = false
+            layoutPanel()
+            motion.snap(to: 0)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            layoutPanel()
+            var results: [String: Any] = [:]
+            let render = motion.onFrame
+            for opening in [true, false] {
+                let started = ProcessInfo.processInfo.systemUptime
+                var samples: [[String: Double]] = []
+                motion.onFrame = { [self] progress in
+                    let frameStart = ProcessInfo.processInfo.systemUptime
+                    render?(progress)
+                    let now = ProcessInfo.processInfo.systemUptime
+                    samples.append(["elapsedMs": (now - started) * 1000,
+                                    "renderMs": (now - frameStart) * 1000,
+                                    "progress": progress,
+                                    "contentOpacity": surface.hosting.alphaValue,
+                                    "bodyHeight": surface.outline.boundingBoxOfPath.height])
+                }
+                togglePanel()
+                let destination = opening ? 1.0 : 0.0
+                while motion.progress != destination && ProcessInfo.processInfo.systemUptime - started < 5 {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+                results[opening ? "opening" : "closing"] = [
+                    "completed": motion.progress == destination,
+                    "elapsedMs": samples.last?["elapsedMs"] ?? 0,
+                    "firstContentMs": samples.first(where: { ($0["contentOpacity"] ?? 0) > 0.1 })?["elapsedMs"] ?? -1,
+                    "maxRenderMs": samples.compactMap { $0["renderMs"] }.max() ?? 0,
+                    "frameCount": samples.count,
+                    "samples": samples
+                ]
+                motion.onFrame = render
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: results, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            NSApp.terminate(nil)
+        }
+    }
+
     /// Exercises real panel visibility and placement without mouse injection,
     /// Agent connections, or changes to the user's saved preferences.
     private func runPresentationChecks(to path: String) {
@@ -529,9 +639,45 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             togglePanel()
             await settle()
             results["menuBarClickOpens"] = panel.isVisible && model.expanded
+            results["menuBarKeepsIconAboveIntake"] = panel.level.rawValue < NSWindow.Level.mainMenu.rawValue
             if let menuLayout = layout {
-                let menuBody = CGRect(x: panel.frame.midX - menuLayout.width / 2, y: panel.frame.maxY - menuLayout.height, width: menuLayout.width, height: menuLayout.height)
+                let menuBody = panel.convertToScreen(surface.hosting.convert(surface.hosting.bounds, to: nil))
                 results["menuBarBodyFitsDisplay"] = menuLayout.visibleFrame.contains(menuBody)
+            }
+            if let iconFrame = statusIconFrame() {
+                let windowFrame = panel.frame
+                let contentFrame = panel.convertToScreen(surface.hosting.convert(surface.hosting.bounds, to: nil))
+                var windowStaysFixed = true
+                var contentStaysFixed = true
+                var staysBelowMenuBar = true
+                var menuBarRejectsHits = true
+                for progress in [0.75, 0.5, 0.25, 0.1, 0.005] {
+                    motion.snap(to: progress)
+                    windowStaysFixed = windowStaysFixed && panel.frame == windowFrame
+                    contentStaysFixed = contentStaysFixed
+                        && panel.convertToScreen(surface.hosting.convert(surface.hosting.bounds, to: nil)) == contentFrame
+                    if let clip = surface.drawingClipRect, let bottom = layout?.menuBarBottom {
+                        let clippedScreenRect = panel.convertToScreen(surface.convert(clip, to: nil))
+                        staysBelowMenuBar = staysBelowMenuBar && clippedScreenRect.maxY <= bottom + 0.000001
+                    } else { staysBelowMenuBar = false }
+                    menuBarRejectsHits = menuBarRejectsHits
+                        && !surface.containsScreenPoint(CGPoint(x: iconFrame.midX, y: iconFrame.midY))
+                }
+                results["menuBarCollapseKeepsWindowPosition"] = windowStaysFixed
+                results["menuBarCollapseKeepsContentPositionAndSize"] = contentStaysFixed
+                results["menuBarNeverDrawsInsideSystemBar"] = staysBelowMenuBar
+                results["menuBarHiddenIntakeRejectsHits"] = menuBarRejectsHits
+                motion.snap(to: 0.005)
+                let tailFrame = panel.convertToScreen(surface.convert(surface.outline.boundingBoxOfPath, to: nil))
+                results["menuBarTailEntersIcon"] = iconFrame.contains(tailFrame)
+                motion.snap(to: 0.00001)
+                let endFrame = panel.convertToScreen(surface.convert(surface.outline.boundingBoxOfPath, to: nil))
+                results["menuBarCollapseEndsAtIconCenter"] = abs(endFrame.midX - iconFrame.midX) < 0.01
+                    && abs(endFrame.midY - iconFrame.midY) < 0.01
+                motion.snap(to: 0)
+                results["menuBarCollapseLeavesNoTile"] = surface.outline.boundingBoxOfPath.width == 0
+                    && surface.outline.boundingBoxOfPath.height == 0
+                motion.snap(to: 1)
             }
             togglePanel()
             await settle()
@@ -541,6 +687,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             results["settingsRemainReachable"] = panel.isVisible && model.showingSettings
             model.setPresentation(.floating)
             layoutPanel()
+            results["floatingRestoresWindowLevel"] = panel.level == .statusBar
+            results["floatingRemovesMenuBarClip"] = surface.drawingClipRect == nil && surface.layer?.mask == nil
             let expandedBeforeReset = model.expanded
             let selectedBeforeReset = model.selectedID
             model.resetFloatingPosition()

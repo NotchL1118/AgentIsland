@@ -75,16 +75,35 @@ final class InstallerTests: XCTestCase {
         XCTAssertEqual(manager.status(.claude).state, .installed)
     }
 
-    func testOnlyApprovalsAndQuestionsBlockTheAgent() throws {
+    func testAllClaudeHooksAreAsyncAndNeverWaitForTheObserver() throws {
         try manager.install(.claude)
         let config = try json(claudeSettings)
         for (event, groups) in config["hooks"]?.objectValue ?? [] {
             for group in groups.arrayValue ?? [] {
                 let hook = group["hooks"]!.arrayValue![0]
-                let blocking = event == "PermissionRequest" || group["matcher"]?.stringValue == "AskUserQuestion"
-                XCTAssertEqual(hook["async"], blocking ? nil : .bool(true), event)
-                XCTAssertEqual(hook["command"]?.stringValue?.contains("--wait"), blocking, event)
+                XCTAssertEqual(hook["async"], .bool(true), event)
+                XCTAssertEqual(hook["command"]?.stringValue?.contains("--wait"), false, event)
             }
+        }
+    }
+
+    func testReinstallMigratesLegacyApprovalHooksAndKeepsUserHooks() throws {
+        for (provider, path) in [(AgentProvider.claude, claudeSettings), (.codex, codexHooks)] {
+            let passiveCommand = HookCommand.command(for: provider, waiting: false, fallbackPrintsEmptyObject: provider == .codex)
+            let oldCommand = passiveCommand.replacingOccurrences(of: " " + HookCommand.marker, with: " --wait " + HookCommand.marker)
+            let oldHook = JSONValue.object([("type", .string("command")), ("command", .string(oldCommand)), ("timeout", .number("125"))])
+            let userHook = JSONValue.object([("type", .string("command")), ("command", .string("my-notification"))])
+            let group = JSONValue.object([("hooks", .array([oldHook, userHook]))])
+            let oldConfig = JSONValue.object([("hooks", .object([("PermissionRequest", .array([group]))]))])
+            try write(String(decoding: oldConfig.serialized(), as: UTF8.self), to: path)
+            try manager.install(provider)
+            let config = try json(path)
+            let groups = try XCTUnwrap(config["hooks"]?["PermissionRequest"]?.arrayValue)
+            XCTAssertEqual(groups.first?["hooks"]?.arrayValue, [userHook])
+            XCTAssertEqual(groups.last?["hooks"]?.arrayValue?.first?["async"], .bool(true))
+            XCTAssertTrue(try commands(path).allSatisfy { !$0.contains("--wait") })
+            XCTAssertEqual(HookCommand.command(for: provider, waiting: true, fallbackPrintsEmptyObject: provider == .codex), passiveCommand,
+                           "Legacy callers cannot reintroduce waiting")
         }
     }
 
@@ -151,10 +170,10 @@ final class InstallerTests: XCTestCase {
     func testInstalledHooksForwardWhilePresentAndStayInertWhenRemoved() throws {
         try manager.install(.claude)
         try manager.install(.codex)
-        let claude = try XCTUnwrap(commands(claudeSettings).first { $0.contains("--wait") })
+        let claude = try XCTUnwrap(commands(claudeSettings).first)
         let codex = try XCTUnwrap(commands(codexHooks).first)
 
-        XCTAssertEqual(try runInstalled(claude).output, "forwarded hook claude --wait --agent-island-owned\n")
+        XCTAssertEqual(try runInstalled(claude).output, "forwarded hook claude --agent-island-owned\n")
 
         try FileManager.default.removeItem(at: helper)               // app deleted / moved
         XCTAssertEqual(try runInstalled(claude).status, 0)
@@ -173,7 +192,24 @@ final class InstallerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent("Library").path))
     }
 
-    // MARK: Codex trust records
+    // MARK: Codex lifecycle constraints and trust records
+
+    func testCodexLifecycleHooksRespectShutdownLimitsWithoutWaitingForApproval() throws {
+        try manager.install(.codex)
+        let config = try json(codexHooks)
+        for event in ["Interrupt", "SessionEnd"] {
+            let hook = try XCTUnwrap(config["hooks"]?[event]?.arrayValue?.first?["hooks"]?.arrayValue?.first)
+            XCTAssertEqual(hook["timeout"], .number("3"), event)
+            XCTAssertEqual(hook["async"], event == "SessionEnd" ? nil : .bool(true), event)
+            XCTAssertEqual(hook["command"]?.stringValue,
+                           HookCommand.command(for: .codex, waiting: false, fallbackPrintsEmptyObject: true),
+                           "Lifecycle notifications must keep their original command without --wait")
+        }
+        let approval = try XCTUnwrap(config["hooks"]?["PermissionRequest"]?.arrayValue?.first?["hooks"]?.arrayValue?.first)
+        XCTAssertEqual(approval["async"], .bool(true))
+        XCTAssertEqual(approval["command"]?.stringValue?.contains("--wait"), false)
+        XCTAssertEqual(approval["timeout"], .number("5"))
+    }
 
     func testCodexUninstallRemovesOwnTrustAndRekeysMovedUserHooks() throws {
         let path = codexHooks.path

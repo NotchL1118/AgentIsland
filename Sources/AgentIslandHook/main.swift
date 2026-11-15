@@ -5,13 +5,14 @@ import IslandIntegrations
 
 // agent-island-hook — the single runtime every persistent integration calls.
 //
-//   hook <provider> [--wait]            run as an agent hook (stdin JSON → stdout)
+//   hook <provider>                     publish an observation from stdin JSON
 //   install|uninstall <provider> [--config <path>]
 //   uninstall-all                       remove every integration and Agent Island's own files
 //   status                              show what is installed where
 //   emit [--timeout <seconds>]          send one protocol event from stdin, print the reply
 //
-// In hook mode it always exits 0. Silence means "no decision", never "allow".
+// In hook mode it always exits 0 and never reads a reply or produces a decision.
+// Legacy --wait arguments are accepted but have no effect.
 
 signal(SIGPIPE, SIG_IGN)
 var arguments = Array(CommandLine.arguments.dropFirst()).filter { $0 != HookCommand.marker }
@@ -50,9 +51,13 @@ func runHook() -> Never {
         if let silent { print(silent) }
         exit(0)
     }
-    let context = HookContext(send: { transport.send($0, timeout: $1) })
-    if let output = adapter.handle(payload, waiting: arguments.contains("--wait"), context: context) { print(output) }
-    else if let silent { print(silent) }
+    let context = HookContext(send: { event, _ in
+        transport.publish(event)
+        return nil
+    })
+    _ = adapter.handle(payload, waiting: false, context: context)
+    // Keep hook stdout neutral even if an adapter ever returns control output.
+    if let silent { print(silent) }
     exit(0)
 }
 

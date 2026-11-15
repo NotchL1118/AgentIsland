@@ -2,8 +2,8 @@ import Foundation
 import Darwin
 import IslandCore
 
-/// Sends one event per connection and reads one reply line. Every failure maps
-/// to `nil`, which adapters must treat as "no decision", never as approval.
+/// Hook observations use `publish`: nonblocking, best effort, and no reply read.
+/// `send` is only for explicit diagnostic requests such as `emit`.
 public struct HookTransport: Sendable {
     public static let maximumBytes = 1024 * 1024
     public var path: String
@@ -21,6 +21,45 @@ public struct HookTransport: Sendable {
         var info = stat()
         guard lstat(path, &info) == 0 else { return false }
         return (info.st_mode & S_IFMT) == S_IFSOCK && info.st_uid == getuid()
+    }
+
+    /// A stalled, overloaded, or old app must never hold up an agent. If the
+    /// socket cannot accept the entire event immediately, drop the observation.
+    @discardableResult
+    public func publish(_ event: AgentEvent) -> Bool {
+        guard isListening, var packet = try? JSONEncoder().encode(event) else { return false }
+        packet.append(0x0A)
+        guard packet.count <= Self.maximumBytes else { return false }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        guard path.utf8.count < MemoryLayout.size(ofValue: address.sun_path) else { return false }
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            buffer.copyBytes(from: path.utf8)
+            buffer[path.utf8.count] = 0
+        }
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        var noSigPipe: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        guard fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else { return false }
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else { return false }
+        return packet.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let written = Darwin.send(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset, MSG_NOSIGNAL)
+                // No retries or waits on a full socket, including interrupted I/O.
+                guard written > 0 else { return false }
+                offset += written
+            }
+            return true
+        }
     }
 
     public func send(_ event: AgentEvent, timeout: TimeInterval) -> BridgeReply? {
@@ -49,7 +88,7 @@ public struct HookTransport: Sendable {
         let sent = packet.withUnsafeBytes { buffer -> Bool in
             var offset = 0
             while offset < buffer.count {
-                let written = Darwin.send(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset, 0)
+                let written = Darwin.send(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset, MSG_NOSIGNAL)
                 if written < 0 && errno == EINTR { continue }
                 guard written > 0 else { return false }
                 offset += written

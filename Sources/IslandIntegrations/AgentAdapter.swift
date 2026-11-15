@@ -1,8 +1,7 @@
 import Foundation
 import IslandCore
 
-/// What an integration can do. The UI derives its buttons from this instead of
-/// checking provider names.
+/// Observation capabilities. Providers never approve operations or answer questions.
 public struct AgentCapabilities: Sendable, Equatable {
     public var status = true
     public var approval = false
@@ -12,15 +11,17 @@ public struct AgentCapabilities: Sendable, Equatable {
     }
 }
 
-/// One hook registration. Non-blocking hooks run asynchronously so they never
-/// sit inside the agent loop; only decisions the agent must wait for block.
+/// One passive hook registration. Some provider lifecycle events require a
+/// synchronous invocation, but no hook waits for the app or a user decision.
 public struct HookSpec: Sendable, Equatable {
     public var event: String
     public var matcher: String?
-    public var blocking: Bool
     public var timeout: Int
-    public init(_ event: String, matcher: String? = nil, blocking: Bool = false, timeout: Int = 5) {
-        self.event = event; self.matcher = matcher; self.blocking = blocking; self.timeout = timeout
+    public var asynchronous: Bool
+    public init(_ event: String, matcher: String? = nil, timeout: Int = 5,
+                asynchronous: Bool = true) {
+        self.event = event; self.matcher = matcher; self.timeout = timeout
+        self.asynchronous = asynchronous
     }
 }
 
@@ -81,8 +82,8 @@ public struct HookContext {
 
 public protocol AgentAdapter: Sendable {
     var descriptor: AgentDescriptor { get }
-    /// Handle one hook payload. `waiting` is true for blocking registrations.
-    /// The return value is written to stdout verbatim; `nil` prints nothing.
+    /// Observe one hook payload. `waiting` is ignored for legacy --wait callers.
+    /// Output is always neutral: nil or an empty JSON object, never a decision.
     func handle(_ payload: [String: Any], waiting: Bool, context: HookContext) -> String?
     /// Output when the payload cannot be processed or the app is unreachable.
     var silentOutput: String? { get }
@@ -117,8 +118,8 @@ func jsonLine(_ object: [String: Any]) -> String? {
 public struct PiAdapter: AgentAdapter {
     public init() {}
     public var descriptor: AgentDescriptor {
-        AgentDescriptor(provider: .pi, summary: "通过扩展监控任务；启动命令添加 --island-approve-tools 可启用工具审批。",
-                        capabilities: AgentCapabilities(approval: true), injection: .sessionExtension(resource: "pi-extension.ts"),
+        AgentDescriptor(provider: .pi, summary: "通过扩展被动展示任务进度，不接管工具审批。",
+                        capabilities: AgentCapabilities(), injection: .sessionExtension(resource: "pi-extension.ts"),
                         hooks: [], afterInstall: nil)
     }
     public var silentOutput: String? { nil }

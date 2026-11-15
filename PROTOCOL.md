@@ -2,7 +2,7 @@
 
 默认端点：`$TMPDIR/agent-island-<uid>.sock`。原生应用与桥都可通过 `AGENT_ISLAND_SOCKET` 覆盖，便于隔离测试。文件权限为 0600，服务端只接受同一用户连接。
 
-每个连接发送一个 UTF-8 JSON 行（最大 1 MiB），接收一个 JSON 行。正常事件立即回复；有回传通道的审批/问题保持连接，等待用户操作，最长 120 秒。应用从不执行事件中的命令文字。
+每个连接发送一个 UTF-8 JSON 行（最大 1 MiB）。应用校验后立即回复一个接收确认，审批和问题也不保持等待连接。hook 使用尽力、非阻塞写入，发送后关闭连接，不读取回复；只有显式诊断命令 `emit` 等待确认。应用从不执行事件中的命令文字，也不回传执行决策。
 
 ```json
 {
@@ -30,7 +30,7 @@
 
 `kind`：`sessionStarted`、`turnStarted`、`toolStarted`、`toolFinished`、`approvalRequested`、`questionRequested`、`requestCancelled`、`turnCompleted`、`turnFailed`、`sessionEnded`、`heartbeat`。
 
-问题请求使用 `kind: "question"`，可附 `options: [{"id":"mock","label":"使用 mock"}]`。没有稳定回传接口的等待事件省略 `request`，只显示状态并返回终端，不提供虚假的审批或回答按钮。取消事件只需 `request: {"id":"..."}`。
+问题提醒的顶层事件使用 `kind: "questionRequested"`，详情使用 `request.kind: "question"`，可附 `request.options: [{"id":"mock","label":"使用 mock"}]`。`request` 仅保存供展示的详情，所有选项均只读；上游没有详情时可省略，只显示待处理状态。审批与回答均在原 Agent 中进行。取消事件只需 `request: {"id":"..."}`。
 
 普通确认：
 
@@ -38,21 +38,12 @@
 {"status":"accepted"}
 ```
 
-显式用户决策：
+确认仅表示收到有效协议包，不代表批准、拒绝或完成任何工具执行。重复或过期事件也会立即确认，由状态引擎去重或忽略。旧协议的 `decision` / `answer` 字段保留解码兼容，但应用不产生，hook 也不读取或使用。
+
+无效事件：
 
 ```json
-{"status":"resolved","requestID":"unique-request-id","decision":"allow"}
-{"status":"resolved","requestID":"question-id","decision":"answer","answer":"使用 mock"}
+{"status":"error","message":"Invalid event identity, version or timestamp"}
 ```
 
-`decision` 仅允许 `allow`、`deny`、`answer`。桥必须核对 `requestID`，不可把超时、断连、`unavailable` 或 `error` 当作允许。相同请求不可重复执行。
-
-已有等待连接的同一请求会返回 `status: "duplicate"`。新连接应回退原 Agent，但不能因此发送 `requestCancelled`，以免撤销首条仍有效的连接。
-
-无法处理：
-
-```json
-{"status":"unavailable","requestID":"...","message":"Return to the agent to continue"}
-```
-
-桥在自己的等候超时后发送 `requestCancelled`，服务端也会检查连接关闭以清理过期卡片。新一轮任务应先发 `turnStarted`，只在上游提供可靠标识时传 `turnID`。
+观测连接结束不代表 Agent 的请求已取消，也不会删除提醒。后续工具活动、新轮次、完成、失败或会话结束会清理旧提醒；原 Agent 明确结束某个请求时可发送 `requestCancelled`。新一轮任务应先发 `turnStarted`，只在上游提供可靠标识时传 `turnID`。事件可能在面板离线或繁忙时丢失，不能作为 Agent 执行的控制通道。

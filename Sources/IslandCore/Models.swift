@@ -69,6 +69,8 @@ public struct RequestOption: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// Read-only details of a prompt in the original agent. The observer cannot
+/// resolve it; later agent events update or clear the displayed wait state.
 public struct AgentRequest: Codable, Equatable, Identifiable, Sendable {
     public typealias Kind = RequestKind
 
@@ -187,6 +189,8 @@ public struct AgentEvent: Codable, Equatable, Sendable {
 
 public struct BridgeReply: Codable, Equatable, Sendable {
     public var status: String
+    // Legacy decoding compatibility only. Passive producers do not read replies,
+    // and the app never sends execution decisions or answers.
     public var requestID: String?
     public var decision: String?
     public var answer: String?

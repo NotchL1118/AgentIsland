@@ -6,28 +6,29 @@
 
 ```text
 Agent 配置（settings.json / hooks.json）
-   └─ /bin/sh -c '<存在性检查>' … hook <agent> [--wait] --agent-island-owned
+   └─ /bin/sh -c '<存在性检查>' … hook <agent> --agent-island-owned
         └─ ~/Library/Application Support/AgentIsland/bin/agent-island-hook   固定转发入口（shim）
              └─ Agent Island.app/Contents/Helpers/agent-island-hook          编译好的 hook 运行时
                   └─ 本机 Unix socket → Agent Island
 ```
 
-- **配置里的命令永远不变。** 它不指向应用包，而是调用固定位置的转发入口，并先检查入口是否可执行。应用移动或更新时，只需更新转发入口（应用启动时自动完成），Codex 基于内容哈希的信任也不会失效。
+- **转发路径固定。** 配置不指向应用包，而是调用固定位置的转发入口，并先检查入口是否可执行。应用移动时只需更新转发入口（启动时自动完成），无需修改 hook 定义；升级改变 hook 定义时，Codex 仍需重新信任。
 - **删除应用后无害。** 转发入口找不到应用、或转发入口本身不存在时，hook 读完 stdin 后以 0 退出（Codex 输出 `{}`）。Claude Code 把 exit 2 视为阻断（会拦下工具调用、提示和 Stop），这条路径永远不会产生 2。
-- **只有需要结果的 hook 才同步。** Claude 的 `PermissionRequest` 与 `PreToolUse[AskUserQuestion]`、Codex 的 `PermissionRequest` 带 `--wait` 同步执行；其他 hook 均注册为 `async: true`。面板未运行时，hook 不探测终端，直接退出。
+- **全部用于被动观测。** Claude hooks 与 Codex 除 `SessionEnd` 外的 hooks 均注册为 `async: true`，包括审批和问题提醒。Codex `SessionEnd` 按上游限制保留 3 秒超时的同步入口，但运行时仅非阻塞写入 socket、不读取回复。面板未运行时直接退出；卡住、缓冲区满或写入失败时丢弃观测。
+- **旧等待参数无效。** 新运行时忽略旧 `--wait`，只输出中性的空结果。更新接入将旧同步注册替换为异步，不改其他用户 hooks；Codex 中变更后的定义需要重新信任。
 - **归属只认自己写下的完整命令形态**（转发入口路径 + 结尾标记 `--agent-island-owned`）。仅在文字里提到标记的用户 hook 不会被当成我们的。
 
 ## 能力
 
-| Agent | 状态 / 完成 | 面板审批 | 面板回答 |
-| --- | --- | --- | --- |
-| Claude Code | SessionStart、UserPromptSubmit、工具事件、Notification、Stop、StopFailure、SessionEnd | PermissionRequest 单次允许/拒绝 | AskUserQuestion 单选与自定义文本，多题逐题回答 |
-| Codex Desktop / CLI | SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、Stop、Interrupt、SessionEnd | PermissionRequest 允许/拒绝 | 回 Codex 处理 |
-| Pi 1.3+ | 生命周期、工具活动、最终 agent_settled、异常/中断 | 显式开启 `--island-approve-tools` 后，审批 bash/write/edit | 原生扩展问题显示“等待回答”，需回 Pi 处理 |
+| Agent | 状态 / 完成 | 只读提醒 |
+| --- | --- | --- |
+| Claude Code | SessionStart、UserPromptSubmit、工具事件、Notification、Stop、StopFailure、SessionEnd | PermissionRequest、AskUserQuestion、ExitPlanMode |
+| Codex Desktop / CLI | SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、Stop、Interrupt、SessionEnd | PermissionRequest |
+| Pi 1.3+ | 生命周期、工具活动、最终 agent_settled、异常/中断 | 原生扩展问题 |
 
-所有审批只在收到 `requestID` 匹配、`status: "resolved"` 的明确决定后才写出结果；面板不存在、断连、超时或回复不匹配时，交回 Agent 自己的审批流程，绝不默认放行。拒绝只作用于当前请求，不写入持久授权。
+面板不发送允许、拒绝、回答或改写工具输入。审批、问题和计划模式始终由原 Agent 的原生流程处理，用户无需在面板批准任何执行。关闭面板不会改变 Agent 的权限策略。
 
-Claude 含多选题的 AskUserQuestion 与 ExitPlanMode 保留原生界面处理；任何一题无法回答时，整个工具调用原样交回 Claude，不做部分改写。Codex 的子 Agent 生命周期 hook 不注册：它们携带父会话 ID，会把子任务完成误报为主任务完成。
+Codex 的子 Agent 生命周期 hook 不注册：它们携带父会话 ID，会把子任务完成误报为主任务完成。
 
 ## 安装、卸载与记账
 
@@ -55,17 +56,16 @@ H='/Applications/Agent Island.app/Contents/Helpers/agent-island-hook'
 
 ```sh
 pi -e '/Applications/Agent Island.app/Contents/Resources/Integrations/pi-extension.ts'
-pi -e '…/pi-extension.ts' --island-approve-tools     # 执行 bash/write/edit 前先在面板审批
 ```
 
-状态事件发送后不等待回复，面板卡住也不会拖慢 Pi。扩展只在收到匹配的显式允许后放行；面板不可用时，支持交互的 Pi 会显示自己的确认框，没有交互 UI 或用户拒绝/超时则阻止该操作。
+扩展不注册 `tool_call` 拦截，不返回执行决策，也不添加确认框。旧 `--island-approve-tools` 参数仅兼容已有启动命令，不再生效。所有事件（含退出）发出后立即返回，不等待回复；socket 和清理计时器不会延长 Pi 进程生命周期。终端信息只读环境变量，可通过 `AGENT_ISLAND_TTY` 提供 TTY。
 
 ## 新增 Agent
 
 在 `Sources/IslandIntegrations` 中实现 `AgentAdapter` 并加入 `AdapterRegistry.all`：
 
-- `descriptor`：显示说明、能力（status / approval / question）、注入方式（`hookConfig` 指定配置文件位置与信任存储，或 `sessionExtension`），以及要注册的 hook（是否同步、超时）。
-- `handle(_:waiting:context:)`：把 Agent 的 hook 载荷映射为协议事件；需要回写时，只在收到匹配的明确决定后输出 Agent 要求的格式。
+- `descriptor`：显示说明、状态观测能力、注入方式（`hookConfig` 指定配置文件位置与信任存储，或 `sessionExtension`），以及要注册的 hook（是否异步、超时）。
+- `handle(_:waiting:context:)`：把 Agent 的 hook 载荷映射为只读协议事件；`waiting` 仅兼容旧接口，无效果。不得返回控制结果或修改工具输入。
 
 界面、安装、记账、卸载、残留扫描与 `status` 都从描述生成。协议见 [PROTOCOL.md](../PROTOCOL.md)。
 

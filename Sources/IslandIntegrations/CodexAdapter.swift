@@ -3,7 +3,7 @@ import IslandCore
 
 /// Codex lifecycle hooks, shared by Codex CLI and Codex Desktop (both read
 /// `$CODEX_HOME/hooks.json`). Codex always receives a JSON object on stdout;
-/// `{}` hands control back to Codex's own approval UI and never approves.
+/// `{}` leaves Codex's own approval flow untouched, regardless of app replies.
 public struct CodexAdapter: AgentAdapter {
     public static let desktopBundleID = "com.openai.codex"
     static let mapping: [String: EventKind] = [
@@ -17,8 +17,8 @@ public struct CodexAdapter: AgentAdapter {
     public var descriptor: AgentDescriptor {
         AgentDescriptor(
             provider: .codex,
-            summary: "Codex Desktop 与 CLI：状态与审批。安装后需在 Codex 的 hooks 设置中检查并信任。",
-            capabilities: AgentCapabilities(approval: true),
+            summary: "Codex Desktop 与 CLI：被动展示状态和审批提醒。安装后需在 Codex 的 hooks 设置中检查并信任。",
+            capabilities: AgentCapabilities(),
             injection: .hookConfig(HookConfigTarget(
                 defaultPath: { env, home in
                     let directory = env["CODEX_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
@@ -30,8 +30,11 @@ public struct CodexAdapter: AgentAdapter {
             // session id, so their Stop would be misreported as the parent's completion.
             hooks: [
                 HookSpec("SessionStart"), HookSpec("UserPromptSubmit"), HookSpec("PreToolUse"), HookSpec("PostToolUse"),
-                HookSpec("PermissionRequest", blocking: true, timeout: 125),
-                HookSpec("Stop"), HookSpec("Interrupt"), HookSpec("SessionEnd"),
+                HookSpec("PermissionRequest"),
+                HookSpec("Stop"),
+                // Codex caps these lifecycle hooks at 3 seconds and runs SessionEnd synchronously.
+                HookSpec("Interrupt", timeout: 3),
+                HookSpec("SessionEnd", timeout: 3, asynchronous: false),
             ],
             afterInstall: "请在 Codex 中打开 hooks 设置（CLI 为 /hooks），检查并信任新增的 Agent Island hooks。安装不会绕过信任。")
     }
@@ -39,25 +42,11 @@ public struct CodexAdapter: AgentAdapter {
     public var silentOutput: String? { "{}" }
 
     public func handle(_ payload: [String: Any], waiting: Bool, context: HookContext) -> String? {
-        jsonLine(run(payload, context: context)) ?? "{}"
-    }
-
-    func run(_ payload: [String: Any], context: HookContext) -> [String: Any] {
-        guard let event = event(for: payload, context: context) else { return [:] }
-        guard event.kind == .approvalRequested, let request = event.request else {
-            _ = context.send(event, 0.7)
-            return [:]
+        if let event = event(for: payload, context: context) {
+            _ = context.send(event, 0.05)
         }
-        let wait = Double(context.environment["AGENT_ISLAND_APPROVAL_TIMEOUT"] ?? "").map { min(120, max(1, $0)) } ?? 120
-        let reply = context.send(event, wait)
-        if let output = Self.permissionOutput(reply: reply, requestID: request.id) { return output }
-        if reply?.status != "duplicate" {
-            var cancel = event
-            cancel.id = UUID().uuidString; cancel.timestamp = context.now(); cancel.kind = .requestCancelled
-            cancel.message = "审批已交回 Codex，请在那里处理。"
-            _ = context.send(cancel, 0.35)
-        }
-        return [:]
+        // Ignore old --wait arguments and any reply from the observer.
+        return "{}"
     }
 
     func event(for payload: [String: Any], context: HookContext) -> AgentEvent? {
@@ -86,9 +75,9 @@ public struct CodexAdapter: AgentAdapter {
         case "PostToolUse": event.message = "\(tool) 已返回结果"
         case "PermissionRequest":
             let detail = nonEmpty(string(input["command"] as? String, limit: 4000)) ?? string(input, limit: 4000)
-            let title = nonEmpty(string(input["description"] as? String, limit: 500)) ?? "允许 Codex 执行 \(tool)？"
+            let title = nonEmpty(string(input["description"] as? String, limit: 500)) ?? "等待在 Codex 审批：\(tool)"
             event.request = AgentRequest(id: UUID().uuidString, kind: .approval, title: title, detail: detail)
-            event.message = "等待你批准工具请求"
+            event.message = "等待在 Codex 处理工具审批"
         case "Stop": event.message = nonEmpty(string(payload["last_assistant_message"] as? String, limit: 4000)) ?? "本轮任务已完成"
         case "Interrupt": event.message = "本轮任务已被用户中断"
         default: event.message = "Codex 会话已结束"
@@ -96,11 +85,4 @@ public struct CodexAdapter: AgentAdapter {
         return event
     }
 
-    static func permissionOutput(reply: BridgeReply?, requestID: String) -> [String: Any]? {
-        guard let reply, reply.status == "resolved", reply.requestID == requestID,
-              let decision = reply.decision, decision == "allow" || decision == "deny" else { return nil }
-        var output: [String: Any] = ["behavior": decision]
-        if decision == "deny" { output["message"] = nonEmpty(String((reply.message ?? "").prefix(1000))) ?? "用户在 Agent Island 中拒绝了本次请求。" }
-        return ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": output]]
-    }
 }

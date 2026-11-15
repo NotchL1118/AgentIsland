@@ -16,9 +16,9 @@ public enum HookCommand {
     public static func command(for provider: AgentProvider, waiting: Bool, fallbackPrintsEmptyObject: Bool) -> String {
         let fallback = fallbackPrintsEmptyObject ? "cat >/dev/null; printf \"{}\\n\"; exit 0" : "cat >/dev/null; exit 0"
         let script = "h=\"$HOME/\(shimRelativePath)\"; [ -x \"$h\" ] && exec \"$h\" \"$@\"; \(fallback)"
-        var arguments = ["agent-island-hook", "hook", provider.rawValue]
-        if waiting { arguments.append("--wait") }
-        arguments.append(marker)
+        // Keep the parameter for callers upgrading from decision-capable hooks.
+        // No installed command may re-enable the legacy wait mode.
+        let arguments = ["agent-island-hook", "hook", provider.rawValue, marker]
         return "/bin/sh -c '\(script)' " + arguments.joined(separator: " ")
     }
 
@@ -116,11 +116,11 @@ public enum HookConfigPatcher {
         descriptor.hooks.map { spec in
             var handler: [(String, JSONValue)] = [
                 ("type", .string("command")),
-                ("command", .string(HookCommand.command(for: descriptor.provider, waiting: spec.blocking,
+                ("command", .string(HookCommand.command(for: descriptor.provider, waiting: false,
                                                        fallbackPrintsEmptyObject: target.fallbackPrintsEmptyObject))),
                 ("timeout", .number(String(spec.timeout))),
             ]
-            if !spec.blocking { handler.append(("async", .bool(true))) }
+            if spec.asynchronous { handler.append(("async", .bool(true))) }
             var group: [(String, JSONValue)] = []
             if let matcher = spec.matcher { group.append(("matcher", .string(matcher))) }
             group.append(("hooks", .array([.object(handler)])))
