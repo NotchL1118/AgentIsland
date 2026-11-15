@@ -51,6 +51,11 @@ public struct CodexAdapter: AgentAdapter {
 
     func event(for payload: [String: Any], context: HookContext) -> AgentEvent? {
         guard let name = payload["hook_event_name"] as? String, let kind = Self.mapping[name] else { return nil }
+        // Observe persisted conversations only. Ephemeral work such as suggested
+        // replies must not create tasks or overwrite a real turn's state.
+        // Check metadata without reading the transcript file.
+        guard let transcript = payload["transcript_path"] as? String,
+              !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let session = string(payload["session_id"], limit: 512)
         guard !session.isEmpty, payload["session_id"] is String else { return nil }
         let cwd = (payload["cwd"] as? String).map { String($0.prefix(4096)) }

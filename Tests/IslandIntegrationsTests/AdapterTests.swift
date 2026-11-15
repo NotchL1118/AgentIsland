@@ -105,20 +105,84 @@ final class CodexAdapterTests: XCTestCase {
     }
     let adapter = CodexAdapter()
 
+    func payload(_ hook: String, _ extra: [String: Any] = [:]) -> [String: Any] {
+        ["hook_event_name": hook, "session_id": "s",
+         "transcript_path": "/nonexistent/example/session.jsonl"].merging(extra) { $1 }
+    }
+
     func testLifecycleMappingAndCompaction() {
         for (hook, kind) in CodexAdapter.mapping {
-            XCTAssertEqual(adapter.event(for: ["hook_event_name": hook, "session_id": "s"], context: context())?.kind, kind)
+            XCTAssertEqual(adapter.event(for: payload(hook), context: context())?.kind, kind)
         }
-        let compact = adapter.event(for: ["hook_event_name": "SessionStart", "session_id": "s", "source": "compact"], context: context())
+        let compact = adapter.event(for: payload("SessionStart", ["source": "compact"]), context: context())
         XCTAssertEqual(compact?.kind, .heartbeat)
         XCTAssertNil(compact?.title)
-        XCTAssertNil(adapter.event(for: ["hook_event_name": "SubagentStop", "session_id": "s"], context: context()))
-        XCTAssertNil(adapter.event(for: ["hook_event_name": "Stop"], context: context()))
+        XCTAssertNil(adapter.event(for: payload("SubagentStop"), context: context()))
+        var missingIdentity = payload("Stop")
+        missingIdentity.removeValue(forKey: "session_id")
+        XCTAssertNil(adapter.event(for: missingIdentity, context: context()))
+    }
+
+    func testEveryLifecycleHookWithoutTranscriptIsSilentlyIgnored() {
+        let invalidPaths: [Any?] = [nil, NSNull(), "", " \n\t ", 42, true,
+                                   ["/example/session.jsonl"], ["path": "/example/session.jsonl"]]
+        for hook in CodexAdapter.mapping.keys {
+            for invalidPath in invalidPaths {
+                var input = payload(hook, ["prompt": "推送到远程吧", "last_assistant_message": "推送到远程吧"])
+                if let invalidPath { input["transcript_path"] = invalidPath }
+                else { input.removeValue(forKey: "transcript_path") }
+                XCTAssertNil(adapter.event(for: input, context: context()), hook)
+                for waiting in [false, true] {
+                    XCTAssertEqual(adapter.handle(input, waiting: waiting, context: context()), "{}", hook)
+                    XCTAssertTrue(sent.isEmpty, "\(hook) must not publish a background observation")
+                }
+            }
+        }
+    }
+
+    func testSubmittedRecommendationTextWithTranscriptRemainsARealTask() {
+        // Metadata distinguishes real submissions; the wording and local file
+        // existence must not decide whether a task is observed.
+        XCTAssertEqual(adapter.handle(payload("UserPromptSubmit", ["prompt": "推送到远程吧", "turn_id": "turn-7"]),
+                                      waiting: false, context: context()), "{}")
+        XCTAssertEqual(sent.map(\.0.kind), [.turnStarted])
+        XCTAssertEqual(sent.first?.0.title, "推送到远程吧")
+        XCTAssertEqual(sent.first?.0.turnID, "turn-7")
+    }
+
+    func testRecommendationHooksCannotChangeAnActiveOrCompletedSession() {
+        var store = SessionStore()
+        let context = HookContext(environment: [:], send: { event, _ in
+            store.apply(event)
+            return nil
+        }, terminal: { nil }, now: { 1 })
+        XCTAssertEqual(adapter.handle(payload("UserPromptSubmit", ["prompt": "Actual task"]),
+                                      waiting: false, context: context), "{}")
+        XCTAssertEqual(store.sessions["codex:s"]?.status, .working)
+        let active = store.sessions["codex:s"]
+        for hook in ["UserPromptSubmit", "Stop"] {
+            var background = payload(hook, ["prompt": "推送到远程吧", "last_assistant_message": "推送到远程吧"])
+            background.removeValue(forKey: "transcript_path")
+            XCTAssertEqual(adapter.handle(background, waiting: false, context: context), "{}")
+            XCTAssertEqual(store.sessions["codex:s"], active)
+        }
+
+        XCTAssertEqual(adapter.handle(payload("Stop", ["last_assistant_message": "Actual result"]),
+                                      waiting: false, context: context), "{}")
+        XCTAssertEqual(store.sessions["codex:s"]?.status, .completed)
+        let completed = store.sessions["codex:s"]
+        for hook in ["UserPromptSubmit", "Stop"] {
+            let background = payload(hook, ["transcript_path": "", "prompt": "推送到远程吧",
+                                            "last_assistant_message": "推送到远程吧"])
+            XCTAssertEqual(adapter.handle(background, waiting: false, context: context), "{}")
+            XCTAssertEqual(store.sessions["codex:s"], completed)
+        }
     }
 
     func testStatusHookAlwaysPrintsEmptyObject() {
         reply = { _ in BridgeReply(status: "resolved", decision: "allow") }
-        XCTAssertEqual(adapter.handle(["hook_event_name": "Stop", "session_id": "s"], waiting: false, context: context()), "{}")
+        XCTAssertEqual(adapter.handle(payload("Stop"), waiting: false, context: context()), "{}")
+        XCTAssertEqual(sent.map(\.0.kind), [.turnCompleted])
     }
 
     func testLegacyApprovalSettingsAndAppRepliesCannotDecide() {
@@ -126,8 +190,7 @@ final class CodexAdapterTests: XCTestCase {
             for decision in ["allow", "deny", "answer"] {
                 sent = []
                 reply = { BridgeReply(status: "resolved", requestID: $0.request?.id, decision: decision, answer: "A") }
-                XCTAssertEqual(adapter.handle(["hook_event_name": "PermissionRequest", "session_id": "s",
-                                               "tool_input": ["command": "npm test"]], waiting: waiting,
+                XCTAssertEqual(adapter.handle(payload("PermissionRequest", ["tool_input": ["command": "npm test"]]), waiting: waiting,
                                               context: context(["AGENT_ISLAND_APPROVAL_TIMEOUT": "120"])), "{}")
                 XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested])
                 XCTAssertEqual(sent.first?.0.request?.detail, "npm test")
@@ -138,7 +201,7 @@ final class CodexAdapterTests: XCTestCase {
 
     func testUnavailableObserverLeavesNativeApprovalUntouched() {
         reply = { _ in nil }
-        XCTAssertEqual(adapter.handle(["hook_event_name": "PermissionRequest", "session_id": "s"], waiting: true, context: context()), "{}")
+        XCTAssertEqual(adapter.handle(payload("PermissionRequest"), waiting: true, context: context()), "{}")
         XCTAssertEqual(sent.map(\.0.kind), [.approvalRequested])
     }
 }

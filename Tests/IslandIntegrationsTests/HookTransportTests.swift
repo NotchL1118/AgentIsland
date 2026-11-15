@@ -233,7 +233,7 @@ final class HookTransportTests: XCTestCase {
             let exited = expectation(description: "Legacy \(provider) hook exits without approval")
             process.terminationHandler = { _ in exited.fulfill() }
             try process.run()
-            input.fileHandleForWriting.write(Data(#"{"hook_event_name":"PermissionRequest","session_id":"legacy-wait","tool_name":"Bash","tool_use_id":"call-1","tool_input":{"command":"echo test"}}"#.utf8))
+            input.fileHandleForWriting.write(Data(#"{"hook_event_name":"PermissionRequest","session_id":"legacy-wait","transcript_path":"/synthetic/session.jsonl","tool_name":"Bash","tool_use_id":"call-1","tool_input":{"command":"echo test"}}"#.utf8))
             try input.fileHandleForWriting.close()
             let outcome = XCTWaiter.wait(for: [exited], timeout: 2)
             if outcome != .completed {
