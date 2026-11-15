@@ -17,6 +17,7 @@ cp "$BIN_DIR/AgentIsland" "$APP_DIR/Contents/MacOS/AgentIsland"
 # Compiled hook runtime used by Claude Code / Codex hooks (via the stable shim).
 cp "$BIN_DIR/agent-island-hook" "$APP_DIR/Contents/Helpers/agent-island-hook"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+zsh "$PROJECT_DIR/scripts/generate-app-icon.sh" "$APP_DIR/Contents/Resources/AppIcon.icns"
 # Session-scoped extensions only; persistent hooks no longer ship as scripts.
 cp "$PROJECT_DIR/Integrations/pi-extension.ts" "$APP_DIR/Contents/Resources/Integrations/"
 /usr/bin/codesign --force --deep --sign - "$APP_DIR"
