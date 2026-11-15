@@ -99,40 +99,116 @@ struct IslandView: View {
     }
 
     private var floatingBar: some View {
-        HStack(spacing: 0) {
-            FloatingDragHandle(onClick: { model.expanded.toggle() })
-                .frame(width: max(0, min(width - 40, 300) - 36), height: 36)
-                .overlay {
-                    HStack(spacing: 0) {
+        let bar = FloatingBarLayout(sessions: model.sessions, maximumWidth: width - 40)
+        return FloatingDragHandle(
+            onClick: { model.expanded.toggle() },
+            onClickAt: { point in
+                if let item = bar.items.first(where: { $0.frame.contains(point) }) {
+                    revealFloatingSession(item.sessionID)
+                } else if bar.overflowFrame?.contains(point) == true {
+                    revealFloatingSessions()
+                } else {
+                    model.expanded.toggle()
+                }
+            },
+            onDoubleClick: { model.resetFloatingPosition() },
+            regions: floatingRegions(for: bar)
+        )
+        .frame(width: bar.width, height: 36)
+        .overlay {
+            ZStack(alignment: .topLeading) {
+                if let frame = bar.brandFrame {
+                    HStack(spacing: 8) {
                         Image(systemName: "waveform").foregroundStyle(accent)
-                        Text("Agent Island").fontWeight(.medium).padding(.leading, 8)
-                        Spacer(minLength: 8)
-                        Circle().fill(model.pendingCount > 0 ? .orange : accent).frame(width: 4, height: 4)
-                        Text(model.pendingCount > 0 ? "\(model.pendingCount) 待处理" : "\(model.runningCount) 运行")
-                            .foregroundStyle(.secondary).padding(.leading, 5)
+                        Text("Agent Island").fontWeight(.medium)
                     }
                     .font(.system(size: 11))
-                    .padding(.leading, 20)
-                    .padding(.trailing, 4)
-                    .allowsHitTesting(false)
+                    .frame(width: frame.width, height: 36)
+                    .position(x: frame.midX, y: 18)
                 }
-                .help("拖动浮条可移动；点击展开或收起")
-            Button { model.expanded.toggle() } label: {
+                ForEach(bar.items) { item in
+                    HStack(spacing: 6) {
+                        Text(item.provider.glyph)
+                            .font(.system(size: item.provider.glyph.count > 1 ? 11 : 18, weight: .medium, design: .monospaced))
+                            .foregroundStyle(floatingProviderColor(item.provider))
+                            .frame(width: 18)
+                        if !bar.iconsOnly {
+                            Text(item.label).font(.system(size: 11, weight: .medium))
+                                .lineLimit(1).truncationMode(.middle)
+                            Circle().fill(floatingStatusColor(item.status)).frame(width: 4, height: 4)
+                        }
+                    }
+                    .padding(.horizontal, bar.iconsOnly ? 0 : 6)
+                    .frame(width: item.frame.width, height: 36)
+                    .position(x: item.frame.midX, y: 18)
+                }
+                if let frame = bar.overflowFrame {
+                    Text("+\(bar.overflowCount)")
+                        .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                        .frame(width: frame.width, height: 36)
+                        .position(x: frame.midX, y: 18)
+                }
                 Image(systemName: model.expanded ? "chevron.up" : "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
+                    .frame(width: bar.chevronFrame.width, height: 36)
+                    .position(x: bar.chevronFrame.midX, y: 18)
             }
-            .buttonStyle(.plain)
-            .help(model.expanded ? "收起 Agent Island" : "展开 Agent Island")
-            .accessibilityLabel(model.expanded ? "收起 Agent Island" : "展开 Agent Island")
+            .frame(width: bar.width, height: 36)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
         }
         .frame(maxWidth: .infinity)
     }
 
+    private func floatingRegions(for bar: FloatingBarLayout) -> [FloatingDragRegion] {
+        var regions = bar.items.map { item in
+            FloatingDragRegion(frame: item.frame, label: item.tooltip) { revealFloatingSession(item.sessionID) }
+        }
+        if let frame = bar.brandFrame {
+            regions.append(FloatingDragRegion(frame: frame, label: "Agent Island · 等待 Agent 接入；双击归位") { model.expanded.toggle() })
+        }
+        if let frame = bar.overflowFrame {
+            regions.append(FloatingDragRegion(frame: frame, label: "查看其余 \(bar.overflowCount) 个 Agent") { revealFloatingSessions() })
+        }
+        regions.append(FloatingDragRegion(frame: bar.chevronFrame, label: model.expanded ? "收起任务；双击归位" : "展开任务；双击归位") { model.expanded.toggle() })
+        return regions
+    }
+
+    private func revealFloatingSession(_ id: String) {
+        guard model.sessions.contains(where: { $0.id == id }) else { return }
+        model.showingSettings = false
+        model.selectedID = id
+        model.expanded = true
+        model.compactSessionRevealID = UUID()
+    }
+
+    private func revealFloatingSessions() {
+        model.showingSettings = false
+        model.selectedID = nil
+        model.expanded = true
+        model.compactSessionRevealID = UUID()
+    }
+
+    private func floatingProviderColor(_ provider: AgentProvider) -> Color {
+        switch provider {
+        case .claude: return Color(red: 0.93, green: 0.75, blue: 0.66)
+        case .codex: return Color(red: 0.69, green: 0.78, blue: 0.96)
+        default: return accent
+        }
+    }
+
+    private func floatingStatusColor(_ status: SessionStatus) -> Color {
+        switch status {
+        case .needsApproval, .needsInput: return .orange
+        case .failed: return .red
+        case .idle, .disconnected: return .gray
+        default: return accent
+        }
+    }
+
     private var heading: some View {
         HStack(spacing: 9) {
-            Text("Agent Island").font(.system(size: 12, weight: .medium))
+            if model.sessions.isEmpty { Text("Agent Island").font(.system(size: 12, weight: .medium)) }
             Text(model.demo ? "演示 · \(model.sessions.count) 个会话" : "\(model.sessions.count) 个会话")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
             Spacer(minLength: 12)
@@ -165,14 +241,29 @@ struct IslandView: View {
                 .padding(20)
                 .modifier(IslandReveal(progress: progress, index: 1))
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(model.sessions.enumerated()), id: \.element.id) { index, session in
-                            SessionCard(model: model, session: session, selected: model.selectedID == session.id)
-                                .modifier(IslandReveal(progress: progress, index: min(index + 1, 4)))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(model.sessions.enumerated()), id: \.element.id) { index, session in
+                                SessionCard(model: model, session: session, selected: model.selectedID == session.id)
+                                    .modifier(IslandReveal(progress: progress, index: min(index + 1, 4)))
+                                    .id(session.id)
+                            }
                         }
                     }
-                }.scrollIndicators(.hidden)
+                    .scrollIndicators(.hidden)
+                    .onChange(of: model.selectedID) { _, id in
+                        if let id { proxy.scrollTo(id, anchor: .top) }
+                    }
+                    .onChange(of: model.compactSessionRevealID) { _, _ in
+                        if let id = model.selectedID ?? model.sessions.first?.id {
+                            proxy.scrollTo(id, anchor: .top)
+                        }
+                    }
+                    .onAppear {
+                        if let id = model.selectedID { proxy.scrollTo(id, anchor: .top) }
+                    }
+                }
             }
         }
     }

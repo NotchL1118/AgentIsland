@@ -9,6 +9,41 @@ class IslandPanel: NSPanel {
     var allowsFreePosition = false
     var dragDidBegin: (() -> Void)?
     var dragDidEnd: (() -> Void)?
+    private var dragCompletionTimer: Timer?
+
+    func beginUserDrag(with event: NSEvent) {
+        guard !isUserDragging else { return }
+        isUserDragging = true
+        dragDidBegin?()
+        NSCursor.closedHand.push()
+        // Window Server owns the drag. performDrag returns immediately and
+        // may consume mouseUp, so keep layout suspended until the button lifts.
+        performDrag(with: event)
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            self.finishUserDragIfReleased(pressedMouseButtons: NSEvent.pressedMouseButtons)
+        }
+        dragCompletionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func finishUserDragIfReleased(pressedMouseButtons: Int) {
+        guard isUserDragging, pressedMouseButtons & 1 == 0 else { return }
+        cancelUserDrag()
+        dragDidEnd?()
+    }
+
+    private func cancelUserDrag() {
+        dragCompletionTimer?.invalidate()
+        dragCompletionTimer = nil
+        if isUserDragging { NSCursor.pop() }
+        isUserDragging = false
+    }
+
+    override func close() {
+        cancelUserDrag()
+        super.close()
+    }
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
@@ -289,9 +324,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         updateStatusItem()
         if positionResetID != model.positionResetID {
             positionResetID = model.positionResetID
-            floatingPosition = nil
-            lastFloatingAnchor = nil
-            if !model.demo { UserDefaults.standard.removeObject(forKey: Self.floatingPositionKey) }
+            recenterFloatingPanel()
         }
         if previousPresentation != model.presentation {
             let changingExistingMode = previousPresentation != nil
@@ -313,7 +346,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         let availableHeight = screen.visibleFrame.height - 40
         let width: CGFloat = min(800, screen.visibleFrame.width - 48)
         let closedHeight: CGFloat = model.menuBarOnly ? 6 : max(notchHeight, 36)
-        let closedWidth: CGFloat = model.menuBarOnly ? 28 : min(width - 40, hasNotch ? max(360, notchWidth + 160) : 300)
+        let closedWidth: CGFloat = model.floating
+            ? FloatingBarLayout(sessions: model.sessions, maximumWidth: width - 40).width
+            : model.menuBarOnly ? 28 : min(width - 40, hasNotch ? max(360, notchWidth + 160) : 300)
         let desired = IslandView.contentHeight(for: model, notchHeight: notchHeight)
         let height = min(desired, availableHeight)
         let anchor: CGPoint
@@ -356,20 +391,41 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         guard model.floating else { return }
         let anchor = CGPoint(x: panel.frame.midX, y: panel.frame.maxY)
         let screens = NSScreen.screens
-        guard let index = PanelPlacement.bestScreenIndex(screenFrames: screens.map(\.visibleFrame), anchor: anchor) else { return }
+        let barSize = CGSize(width: layout?.closedWidth ?? 300, height: 36)
+        guard let index = PanelPlacement.bestScreenIndex(screenFrames: screens.map(\.visibleFrame), anchor: anchor, barSize: barSize) else { return }
         let screen = screens[index]
         let size = surface.outline.boundingBoxOfPath.size
         let fitted = PanelPlacement.clampedAnchor(anchor, visibleFrame: screen.visibleFrame, visibleSize: size)
-        floatingPosition = SavedPanelPosition(displayID: displayID(screen), anchor: fitted, visibleFrame: screen.visibleFrame)
-        lastFloatingAnchor = fitted
-        if !model.demo, let data = try? JSONEncoder().encode(floatingPosition) {
-            UserDefaults.standard.set(data, forKey: Self.floatingPositionKey)
-        }
+        saveFloatingPosition(anchor: fitted, screen: screen)
         layoutPanel()
         // Dropping under the pointer must not synthesize a fresh mouse entry.
         _ = hoverExpansion.update(inside: surface.containsScreenPoint(NSEvent.mouseLocation),
                                   expanded: model.expanded, presentation: model.presentation,
                                   dragging: false, pointerButtonDown: false, isMouseMovement: false)
+    }
+    private func saveFloatingPosition(anchor: CGPoint, screen: NSScreen) {
+        floatingPosition = SavedPanelPosition(displayID: displayID(screen), anchor: anchor, visibleFrame: screen.visibleFrame)
+        lastFloatingAnchor = anchor
+        if !model.demo, let data = try? JSONEncoder().encode(floatingPosition) {
+            UserDefaults.standard.set(data, forKey: Self.floatingPositionKey)
+        }
+    }
+    private func recenterFloatingPanel() {
+        let screens = NSScreen.screens
+        let anchor = CGPoint(x: panel.frame.midX, y: panel.frame.maxY)
+        let barSize = CGSize(width: layout?.closedWidth ?? 300, height: 36)
+        let currentScreen: NSScreen?
+        if model.floating, previousPresentation == .floating,
+           let index = PanelPlacement.bestScreenIndex(screenFrames: screens.map(\.visibleFrame), anchor: anchor, barSize: barSize) {
+            currentScreen = screens[index]
+        } else {
+            currentScreen = screens.first(where: { displayID($0) == floatingPosition?.displayID }) ?? display()
+        }
+        guard let screen = currentScreen else { return }
+        autoCollapse.reset()
+        // Store the chosen display as well as the new position: clearing the
+        // preference could send the bar to the main display instead.
+        saveFloatingPosition(anchor: CGPoint(x: screen.visibleFrame.midX, y: screen.visibleFrame.maxY - 24), screen: screen)
     }
     private func updateMouseAcceptance() {
         // The fixed canvas includes transparent space. Let clicks in that space
@@ -430,7 +486,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             await settle()
             results["floatingCollapsedVisible"] = panel.isVisible
             guard let screen = display(), let currentLayout = layout else { NSApp.terminate(nil); return }
-            let destination = CGPoint(x: screen.visibleFrame.minX + 170, y: screen.visibleFrame.minY + 70)
+            let destination = CGPoint(x: screen.visibleFrame.minX + currentLayout.closedWidth / 2 + 20,
+                                      y: screen.visibleFrame.minY + 70)
             panel.setFrameOrigin(CGPoint(x: destination.x - panel.frame.width / 2, y: destination.y - panel.frame.height))
             finishFloatingDrag()
             let savedPosition = floatingPosition
@@ -449,6 +506,21 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             if let savedPosition, let data = try? JSONEncoder().encode(savedPosition),
                let restored = try? JSONDecoder().decode(SavedPanelPosition.self, from: data) {
                 results["savedPositionRoundTrip"] = restored == savedPosition
+            }
+            // The saved display deliberately stays stale while the real panel
+            // is moved. Reset must use the display under the bar, not the main
+            // screen or the screen from the previous saved position.
+            for (index, targetScreen) in NSScreen.screens.enumerated() {
+                let target = CGPoint(x: targetScreen.visibleFrame.midX + 40,
+                                     y: targetScreen.visibleFrame.maxY - 100)
+                panel.setFrameOrigin(CGPoint(x: target.x - panel.frame.width / 2,
+                                             y: target.y - panel.frame.height))
+                model.resetFloatingPosition()
+                layoutPanel()
+                let expected = CGPoint(x: targetScreen.visibleFrame.midX, y: targetScreen.visibleFrame.maxY - 24)
+                results["resetUsesCurrentDisplay\(index)"] = floatingPosition?.displayID == displayID(targetScreen)
+                    && abs(panel.frame.midX - expected.x) < 1 && abs(panel.frame.maxY - expected.y) < 1
+                    && !model.expanded
             }
             model.setPresentation(.menuBar)
             layoutPanel()
@@ -469,9 +541,16 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
             results["settingsRemainReachable"] = panel.isVisible && model.showingSettings
             model.setPresentation(.floating)
             layoutPanel()
+            let expandedBeforeReset = model.expanded
+            let selectedBeforeReset = model.selectedID
             model.resetFloatingPosition()
             layoutPanel()
-            results["positionResetWorks"] = floatingPosition == nil
+            if let resetScreen = display(), let position = floatingPosition {
+                let restoredAnchor = position.anchor(in: resetScreen.visibleFrame)
+                results["positionResetWorks"] = abs(restoredAnchor.x - resetScreen.visibleFrame.midX) < 1
+                    && abs(restoredAnchor.y - (resetScreen.visibleFrame.maxY - 24)) < 1
+            }
+            results["resetPreservesSelectionAndExpansion"] = model.expanded == expandedBeforeReset && model.selectedID == selectedBeforeReset
 
             for mode in IslandPresentation.allCases {
                 model.setPresentation(mode)

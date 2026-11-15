@@ -22,6 +22,7 @@ final class AppModel: ObservableObject {
     @Published var settingsWindowRequestID = UUID()
     @Published var isSettingsWindowVisible = false
     @Published var selectedID: String?
+    @Published var compactSessionRevealID = UUID()
     @Published var statusMessage = ""
     @Published var serverReady = false
     @Published var notificationsEnabled: Bool
