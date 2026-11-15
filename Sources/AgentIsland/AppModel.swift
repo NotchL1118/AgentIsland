@@ -48,6 +48,7 @@ final class AppModel: ObservableObject {
     var pendingCount: Int { sessions.reduce(0) { $0 + max($1.pendingRequests.count, $1.status.needsAttention ? 1 : 0) } }
     var runningCount: Int { sessions.filter { $0.status == .working }.count }
     var completedCount: Int { sessions.filter { $0.status == .completed }.count }
+    var menuBarActivity: MenuBarActivity { MenuBarActivity(sessions: store.sessions.values) }
     var summary: String {
         if pendingCount > 0 { return "\(pendingCount) 待处理 · \(runningCount) 运行" }
         if runningCount > 0 { return "\(runningCount) 个任务运行中" }

@@ -61,6 +61,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
     private var hoverExpansion = PanelHoverExpansion()
     private var settingsWindowController: SettingsWindowController?
     private var statusItem: NSStatusItem!
+    private var statusPresenter: MenuBarStatusPresenter?
     private var statusMenu: NSMenu!
     private var modeMenuItems: [NSMenuItem] = []
     private var subscriptions = Set<AnyCancellable>()
@@ -234,7 +235,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
     private func makeStatusMenu(demo: Bool) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Agent Island")
+            statusPresenter = MenuBarStatusPresenter(button: button)
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -326,10 +327,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         }
     }
     private func updateStatusItem() {
-        let pending = model.pendingCount
-        statusItem.button?.image = NSImage(systemSymbolName: pending > 0 ? "exclamationmark.circle.fill" : "waveform", accessibilityDescription: "Agent Island")
-        statusItem.button?.title = pending > 0 ? " \(pending)" : ""
-        statusItem.button?.toolTip = "\(model.summary) · 点击展开，右键设置"
+        statusPresenter?.update(activity: model.menuBarActivity, pendingCount: model.pendingCount,
+                                menuBarOnly: model.menuBarOnly,
+                                reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
         for item in modeMenuItems {
             item.state = (item.representedObject as? String) == model.presentation.rawValue ? .on : .off
         }
@@ -524,6 +524,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
     }
     func applicationWillTerminate(_ notification: Notification) {
         model.shutdown()
+        statusPresenter?.stop()
         autoCollapse.reset()
         motion.stop()
         settingsWindowController?.close()
